@@ -122,6 +122,7 @@ class ApplicationEon:
             else None
         )
 
+        self.modeles_sans_tools: set[str] = set()
         self.modele_verrouille: str | None = None
         self.dernier_modele: str | None = None
         self.modele_gpu_charge: str | None = None
@@ -168,7 +169,14 @@ class ApplicationEon:
         if nouveau_modele.lower() in MODELES_LOURDS_GPU:
             self.modele_gpu_charge = nouveau_modele
 
-    def _assembler_outils_tour(self, route_cfg: dict, forcer_web: bool = False) -> dict[str, Callable]:
+    def _assembler_outils_tour(self, modele: str, route_cfg: dict, forcer_web: bool = False) -> dict[str, Callable]:
+        if (
+            modele in self.modeles_sans_tools
+            or route_cfg.get("supports_tools") is False
+            or route_cfg.get("role") == "phatique"
+        ):
+            return {}
+
         outils = dict(self.catalogue_base)
         web_mode = self.routeur.config.get("web_mode", "auto")
         file_mode = self.routeur.config.get("file_mode", "ask")
@@ -274,7 +282,7 @@ class ApplicationEon:
     ) -> str:
         """Exécute la boucle autonome d'appel d'outils et de streaming interruptible."""
         self._liberer_vram_si_changement_lourd(modele)
-        outils_dispo = self._assembler_outils_tour(route_cfg, forcer_web=forcer_web)
+        outils_dispo = self._assembler_outils_tour(modele, route_cfg, forcer_web=forcer_web)
         liste_callables = list(outils_dispo.values()) if not images else []
 
         messages: list[dict[str, Any]] = [
@@ -327,6 +335,15 @@ class ApplicationEon:
                         flux = ollama.chat(**kwargs_chat)
                 except TypeError:
                     flux = ollama.chat(**kwargs_chat)
+                except ollama.ResponseError as err:
+                    if "does not support tools" in str(err).lower() and "tools" in kwargs_chat:
+                        self.modeles_sans_tools.add(modele)
+                        liste_callables = []
+                        kwargs_chat.pop("tools", None)
+                        _log_outil(f"[TOOLS] {modele} ne supporte pas les outils -> bascule texte direct.")
+                        flux = ollama.chat(**kwargs_chat)
+                    else:
+                        raise
 
                 texte_etape = ""
                 tool_calls_etape: list[Any] = []

@@ -12,7 +12,7 @@ try:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical
-    from textual.widgets import Footer, Header, Input, RichLog
+    from textual.widgets import Footer, Header, Input, RichLog, Static
 
     TEXTUAL_DISPONIBLE = True
 except ImportError:
@@ -30,6 +30,7 @@ class _GestionnaireConsoleFallback:
         self.chemins = {
             "logs": dossier_logs / "perception_eon.log",
             "outils": dossier_logs / "outils_eon.log",
+            "audio": dossier_logs / "audio_eon.log",
         }
         self._lock = threading.Lock()
         self._file_prompts: queue.Queue[str] = queue.Queue()
@@ -70,13 +71,13 @@ if TEXTUAL_DISPONIBLE:
             height: 1fr;
         }
         #panneau_chat {
-            width: 62%;
+            width: 60%;
             border: round #38bdf8;
             background: #0d1117;
             padding: 0 1;
         }
         #colonne_droite {
-            width: 38%;
+            width: 40%;
         }
         #panneau_outils {
             height: 1fr;
@@ -89,6 +90,23 @@ if TEXTUAL_DISPONIBLE:
             border: round #4ade80;
             background: #0d1117;
             padding: 0 1;
+        }
+        #bloc_audio {
+            height: 1fr;
+            border: round #c084fc;
+            background: #0d1117;
+            padding: 0 1;
+        }
+        #vu_micro {
+            height: 1;
+            color: #e9d5ff;
+            background: #1e1b2e;
+            padding: 0 1;
+            margin-bottom: 1;
+        }
+        #log_audio {
+            height: 1fr;
+            background: #0d1117;
         }
         #saisie_eon {
             dock: bottom;
@@ -118,6 +136,7 @@ if TEXTUAL_DISPONIBLE:
             self.chemins = {
                 "logs": dossier_logs / "perception_eon.log",
                 "outils": dossier_logs / "outils_eon.log",
+                "audio": dossier_logs / "audio_eon.log",
             }
             self._worker_fn = worker_fn
             self._on_prompt_fn = on_prompt_fn
@@ -136,13 +155,17 @@ if TEXTUAL_DISPONIBLE:
                 with Vertical(id="colonne_droite"):
                     yield RichLog(id="panneau_outils", wrap=True, highlight=False, markup=False)
                     yield RichLog(id="panneau_perception", wrap=True, highlight=False, markup=False)
+                    with Vertical(id="bloc_audio"):
+                        yield Static("Micro : initialisation...", id="vu_micro")
+                        yield RichLog(id="log_audio", wrap=True, highlight=False, markup=False)
             yield Input(placeholder="Écris à Eon ou parle en regardant l'écran (/help)...", id="saisie_eon")
             yield Footer()
 
         def on_mount(self) -> None:
             self.query_one("#panneau_chat", RichLog).border_title = "Conversation"
             self.query_one("#panneau_outils", RichLog).border_title = "Outils · Terminal / Fichiers / Web"
-            self.query_one("#panneau_perception", RichLog).border_title = "Perception · Caméra / Sécurité / Micro"
+            self.query_one("#panneau_perception", RichLog).border_title = "Vision · Caméra / Sécurité"
+            self.query_one("#bloc_audio", Vertical).border_title = "Audio · Micro / Écoute"
             self.query_one("#saisie_eon", Input).focus()
             threading.Thread(target=self._executer_worker, daemon=True).start()
 
@@ -150,7 +173,10 @@ if TEXTUAL_DISPONIBLE:
             try:
                 self._worker_fn()
             finally:
-                self.call_from_thread(self.exit)
+                try:
+                    self.call_from_thread(self.exit)
+                except Exception:
+                    pass
 
         def action_interrompre_ia(self) -> None:
             self._on_escape_fn()
@@ -171,13 +197,32 @@ if TEXTUAL_DISPONIBLE:
                     self.query_one("#panneau_chat", RichLog).write(self._tampon_chat)
                     self._tampon_chat = ""
 
-            self.call_from_thread(_flush)
+            try:
+                self.call_from_thread(_flush)
+            except Exception:
+                pass
 
         def ecrire_chat(self, texte: str, fin: str = "\n") -> None:
             complet = f"{texte}{fin}"
             if not complet:
                 return
-            self.call_from_thread(self._ecrire_chat_ui, complet)
+            try:
+                self.call_from_thread(self._ecrire_chat_ui, complet)
+            except Exception:
+                pass
+
+        def maj_vu_micro(self, texte: str) -> None:
+            """Met à jour la barre de niveau micro en haut de la fenêtre Audio sans faire défiler les logs."""
+            def _maj() -> None:
+                try:
+                    self.query_one("#vu_micro", Static).update(texte)
+                except Exception:
+                    pass
+
+            try:
+                self.call_from_thread(_maj)
+            except Exception:
+                pass
 
         def journaliser(self, canal: str, message: str) -> None:
             horodatage = datetime.now().strftime("%H:%M:%S")
@@ -189,14 +234,25 @@ if TEXTUAL_DISPONIBLE:
                 with self._lock_fichiers, chemin.open("a", encoding="utf-8") as f:
                     f.write(bloc_fichier)
 
-            cible_id = "#panneau_outils" if canal == "outils" else "#panneau_perception"
+            if canal == "outils":
+                cible_id = "#panneau_outils"
+            elif canal == "audio":
+                cible_id = "#log_audio"
+            else:
+                cible_id = "#panneau_perception"
 
             def _maj_panneau() -> None:
-                widget = self.query_one(cible_id, RichLog)
-                for l in lignes:
-                    widget.write(f"[{horodatage}] {l}")
+                try:
+                    widget = self.query_one(cible_id, RichLog)
+                    for l in lignes:
+                        widget.write(f"[{horodatage}] {l}")
+                except Exception:
+                    pass
 
-            self.call_from_thread(_maj_panneau)
+            try:
+                self.call_from_thread(_maj_panneau)
+            except Exception:
+                pass
 
         def demander_ligne(self, invite: str, secret: bool = False) -> str:
             """Permet à un thread d'arrière-plan (shell_tools/file_tools) de demander une confirmation ou un mot de passe."""
@@ -355,6 +411,18 @@ def log_perception(message: str) -> None:
         _APP_TUI.journaliser("logs", message)
     elif _FALLBACK is not None:
         _FALLBACK.journaliser("logs", message)
+
+
+def log_audio(message: str) -> None:
+    if _APP_TUI is not None:
+        _APP_TUI.journaliser("audio", message)
+    elif _FALLBACK is not None:
+        _FALLBACK.journaliser("audio", message)
+
+
+def maj_vu_micro(texte: str) -> None:
+    if _APP_TUI is not None:
+        _APP_TUI.maj_vu_micro(texte)
 
 
 def log_outil(message: str) -> None:

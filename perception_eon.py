@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import re
@@ -7,6 +8,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -63,19 +65,26 @@ COCO_CLASSES_FR = {
 
 # Détection du mot-clé "Éon" (y compris variantes phonétiques fréquentes de Whisper en français)
 REGEX_WAKE_WORD = re.compile(
-    r"(?:\b(?:[ée]on|eon|h[ée]on|eyon|ayon)\b|^(?:eh\s+on|et\s+on)\s*[,!?])",
+    r"(?:\b(?:[ée]ons?|eons?|h[ée]ons?|eyon|ayon)\b|^(?:eh\s+on|et\s+on|est\s+on)\b)",
     re.IGNORECASE,
 )
 
-BRUITS_PARASITES_WHISPER = {
-    "sous-titres réalisés par la communauté d'amara.org",
-    "sous-titrage st' 501",
+HALLUCINATIONS_SUBSTRINGS = (
+    "sous-titres réalisés",
+    "sous-titrage",
+    "amara.org",
     "merci d'avoir regardé",
-    "merci d'avoir regardé cette vidéo",
+    "abonnez-vous",
+)
+
+BRUITS_PARASITES_WHISPER = {
     "à bientôt",
     "merci.",
     "merci",
     "...",
+    "eh",
+    "heu",
+    "euh",
 }
 
 
@@ -109,8 +118,35 @@ def _iou_boites(b1: tuple[int, int, int, int], b2: tuple[int, int, int, int]) ->
     return inter / float(max(1, union))
 
 
+def _barre_vu(rms: float, echelle: float = 0.06, largeur: int = 10) -> str:
+    ratio = min(1.0, max(0.0, rms / max(1e-6, echelle)))
+    remplis = int(round(ratio * largeur))
+    return "▮" * remplis + "▯" * (largeur - remplis)
+
+
+def _reechantillonner_16k(audio: np.ndarray, sr_source: int) -> np.ndarray:
+    """Rééchantillonnage vers 16 kHz avec filtre passe-bas anti-repliement (anti-aliasing)."""
+    if sr_source == 16000 or len(audio) == 0:
+        return audio.astype(np.float32, copy=False)
+
+    signal_f = audio.astype(np.float32, copy=False)
+    if sr_source > 16000:
+        fc = 7200.0 / float(sr_source)
+        nb_taps = 31
+        n = np.arange(nb_taps) - (nb_taps - 1) / 2.0
+        noyau = np.sinc(2.0 * fc * n) * np.hamming(nb_taps)
+        noyau /= np.sum(noyau)
+        signal_f = np.convolve(signal_f, noyau, mode="same").astype(np.float32)
+
+    duree = len(signal_f) / float(sr_source)
+    nb_cible = max(1, int(round(duree * 16000)))
+    x_ancien = np.linspace(0.0, 1.0, num=len(signal_f), endpoint=False)
+    x_nouveau = np.linspace(0.0, 1.0, num=nb_cible, endpoint=False)
+    return np.interp(x_nouveau, x_ancien, signal_f).astype(np.float32)
+
+
 class PerceptionEon:
-    """Perception continue basse consommation (CPU, 0 Mo VRAM) + escalade multimodale (gemma3:12b-it-qat)."""
+    """Perception locale basse consommation (100 % licences permissives MIT / Apache-2.0 / BSD)."""
 
     def __init__(
         self,
@@ -135,7 +171,10 @@ class PerceptionEon:
         self._lock_vision = threading.Lock()
         self._derniere_frame: np.ndarray | None = None
         self._dernier_regard_ts: float = 0.0
+        self._regard_ema: float = 0.0
         self._dernier_vecteur_visage: np.ndarray | None = None
+        self._dernier_resident_reconnu: str = ""
+        self._dernier_resident_ts: float = 0.0
         self._visage_detecte_actuel: bool = False
         self._nb_personnes_actuel: int = 0
         self._personnes_identifiees: list[str] = []
@@ -148,21 +187,23 @@ class PerceptionEon:
         self.micro_actif: bool = False
         self.statut_micro: str = "initialisation"
 
-        # Biométrie multi-résidents (ex: {"Bryan": vec, "Pere": vec})
+        # Biométrie multi-résidents (stockage exclusivement local)
         self.profils_visages: dict[str, np.ndarray] = {}
         self.profil_voix: np.ndarray | None = None
         self._charger_profil()
 
-        # Détecteurs vision légers CPU
-        self._yolo_net = None
+        # Détecteurs vision légers CPU (Apache-2.0 / MIT uniquement)
+        self._yolox_net = None
         self._hog_personnes = None
         self._yunet = None
         self._sface = None
         self._initialiser_modeles_vision_cpu()
 
         self._whisper = None
+        self._whisper_erreur: str = ""
         self._lock_whisper = threading.Lock()
         self._transcriptions_en_attente = 0
+        self._logs_audio_live: queue.Queue[str] = queue.Queue(maxsize=200)
         self._installer_signal_interruption()
 
     # ---------------- CONTRÔLES UI & INTERRUPTION ----------------
@@ -198,6 +239,24 @@ class PerceptionEon:
             signal.signal(signal.SIGUSR1, _handler)
         except (ValueError, OSError):
             pass
+
+    def _push_log_audio(self, msg: str) -> None:
+        try:
+            self._logs_audio_live.put_nowait(msg)
+        except queue.Full:
+            try:
+                self._logs_audio_live.get_nowait()
+                self._logs_audio_live.put_nowait(msg)
+            except queue.Empty:
+                pass
+
+    def _vider_logs_audio(self) -> None:
+        while True:
+            try:
+                msg = self._logs_audio_live.get_nowait()
+                panels.log_audio(msg)
+            except queue.Empty:
+                break
 
     # ---------------- BIOMÉTRIE MULTI-PROFILS ----------------
 
@@ -252,31 +311,32 @@ class PerceptionEon:
         PROFIL_EON_FILE.unlink(missing_ok=True)
         return "Tous les profils biométriques ont été réinitialisés."
 
-    # ---------------- INITIALISATION VISION LÉGÈRE CPU ----------------
+    # ---------------- INITIALISATION VISION LÉGÈRE CPU (APACHE-2.0 / MIT) ----------------
 
     def _initialiser_modeles_vision_cpu(self) -> None:
         if cv2 is None:
             return
         MODELS_VISION_DIR.mkdir(parents=True, exist_ok=True)
 
-        for nom_yolo in ("yolo11n.onnx", "yolov8n.onnx"):
-            chemin_yolo = MODELS_VISION_DIR / nom_yolo
-            if chemin_yolo.exists():
+        # Modèles YOLOX sous licence Apache-2.0 (aucun modèle AGPL)
+        for nom_yolox in ("object_detection_yolox_2022nov.onnx", "yolox_nano.onnx", "yolox_s.onnx"):
+            chemin_yolox = MODELS_VISION_DIR / nom_yolox
+            if chemin_yolox.exists():
                 try:
-                    net = cv2.dnn.readNetFromONNX(str(chemin_yolo))
+                    net = cv2.dnn.readNetFromONNX(str(chemin_yolox))
                     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-                    self._yolo_net = net
+                    self._yolox_net = net
                     break
                 except Exception:
                     pass
 
-        if self._yolo_net is None and hasattr(cv2, "HOGDescriptor"):
+        if self._yolox_net is None and hasattr(cv2, "HOGDescriptor"):
             hog = cv2.HOGDescriptor()
             hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
             self._hog_personnes = hog
 
-        # Seuil YuNet relevé à 0.85 (au lieu de 0.72) pour éliminer les faux visages en arrière-plan
+        # YuNet (MIT) + SFace (Apache-2.0) issus d'OpenCV Model Zoo
         yunet_path = MODELS_VISION_DIR / "face_detection_yunet_2023mar.onnx"
         sface_path = MODELS_VISION_DIR / "face_recognition_sface_2021dec.onnx"
         if yunet_path.exists() and hasattr(cv2, "FaceDetectorYN"):
@@ -292,34 +352,41 @@ class PerceptionEon:
                 self._sface = None
 
     def _detecter_objets_rapide(self, frame: np.ndarray) -> tuple[int, list[str]]:
-        """Retourne (nb_personnes, liste_objets_fr) en ~15-25 ms sur CPU."""
+        """Détection d'objets Apache-2.0 (YOLOX ONNX ou OpenCV HOG) en ~15-25 ms sur CPU."""
         h_img, w_img = frame.shape[:2]
 
-        if self._yolo_net is not None:
-            blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (640, 640), swapRB=True, crop=False)
-            self._yolo_net.setInput(blob)
-            out = self._yolo_net.forward()
-            preds = np.squeeze(out[0]).T
-            scores = np.max(preds[:, 4:], axis=1)
-            masque = scores >= 0.50
+        if self._yolox_net is not None:
+            blob = cv2.dnn.blobFromImage(frame, 1.0, (640, 640), swapRB=True, crop=False)
+            self._yolox_net.setInput(blob)
+            out = self._yolox_net.forward()
+            preds = out[0] if out.ndim == 3 else out
+            if preds.shape[0] == 85 and preds.shape[1] != 85:
+                preds = preds.T
+
+            obj_conf = preds[:, 4]
+            class_scores = preds[:, 5:]
+            class_ids = np.argmax(class_scores, axis=1)
+            scores = obj_conf * class_scores[np.arange(len(preds)), class_ids]
+
+            masque = scores >= 0.45
             preds_valides = preds[masque]
             scores_valides = scores[masque]
+            class_ids_valides = class_ids[masque]
             if len(preds_valides) == 0:
                 return 0, []
 
-            class_ids = np.argmax(preds_valides[:, 4:], axis=1)
             boites = []
             for cx, cy, w, h in preds_valides[:, :4]:
                 x1 = int((cx - w / 2.0) * w_img / 640.0)
                 y1 = int((cy - h / 2.0) * h_img / 640.0)
                 boites.append([x1, y1, int(w * w_img / 640.0), int(h * h_img / 640.0)])
 
-            indices = cv2.dnn.NMSBoxes(boites, scores_valides.tolist(), 0.50, 0.40)
+            indices = cv2.dnn.NMSBoxes(boites, scores_valides.tolist(), 0.45, 0.45)
             nb_pers = 0
             compteur_objets: dict[str, int] = {}
             if len(indices) > 0:
                 for idx in np.array(indices).flatten():
-                    cid = int(class_ids[idx])
+                    cid = int(class_ids_valides[idx])
                     if cid == 0:
                         nb_pers += 1
                     elif cid in COCO_CLASSES_FR:
@@ -360,8 +427,7 @@ class PerceptionEon:
         deja_pris = identites_deja_attribuees or set()
         meilleur_nom = "Inconnu"
         meilleur_score = -1.0
-        # Seuil SFace relevé à 0.46 (vs 0.37) pour éviter de reconnaître n'importe quoi comme Bryan
-        seuil = float(self.cfg.get("seuil_visage_sface", 0.46)) if self._sface is not None else 0.78
+        seuil = float(self.cfg.get("seuil_visage_sface", 0.45)) if self._sface is not None else 0.78
 
         for nom, ref in profils_valides.items():
             if nom in deja_pris or ref.shape != vec.shape:
@@ -375,7 +441,6 @@ class PerceptionEon:
                 meilleur_nom = nom
 
         if meilleur_score >= seuil:
-            # Mise à jour adaptative uniquement si la confiance est très élevée (>= 0.62)
             if meilleur_score >= 0.62:
                 nouveau_ref = 0.94 * self.profils_visages[meilleur_nom] + 0.06 * vec
                 norme = float(np.linalg.norm(nouveau_ref))
@@ -383,6 +448,62 @@ class PerceptionEon:
                     self.profils_visages[meilleur_nom] = nouveau_ref / norme
             return meilleur_nom, round(meilleur_score, 2)
         return "Inconnu", round(max(0.0, meilleur_score), 2)
+
+    @staticmethod
+    def _score_regard_frontal(face_row: np.ndarray) -> float:
+        """
+        Calcule un score [0.0..1.0] d'attention visuelle vers la caméra/écran dans un repère
+        invariant à l'inclinaison de la tête (roll) grâce aux 5 points clés YuNet (yeux, nez, bouche).
+        """
+        re_x, re_y = float(face_row[4]), float(face_row[5])   # Œil droit sujet
+        le_x, le_y = float(face_row[6]), float(face_row[7])   # Œil gauche sujet
+        nt_x, nt_y = float(face_row[8]), float(face_row[9])   # Pointe du nez
+        rc_x, rc_y = float(face_row[10]), float(face_row[11]) # Coin droit bouche
+        lc_x, lc_y = float(face_row[12]), float(face_row[13]) # Coin gauche bouche
+
+        dx_yeux = le_x - re_x
+        dy_yeux = le_y - re_y
+        dist_yeux = math.hypot(dx_yeux, dy_yeux)
+        if dist_yeux < 18.0:
+            return 0.0
+
+        # 1. Inclinaison latérale de la tête (roll)
+        roll_deg = abs(math.degrees(math.atan2(dy_yeux, dx_yeux)))
+        if roll_deg > 28.0:
+            return 0.0
+
+        # Repère orthonormé lié au visage : u = axe inter-oculaire, v = axe vertical descendant
+        ux, uy = dx_yeux / dist_yeux, dy_yeux / dist_yeux
+        vx, vy = -uy, ux
+
+        mid_eyes_x = (re_x + le_x) * 0.5
+        mid_eyes_y = (re_y + le_y) * 0.5
+        mid_mouth_x = (rc_x + lc_x) * 0.5
+        mid_mouth_y = (rc_y + lc_y) * 0.5
+
+        # Projections nez et bouche
+        dn_x, dn_y = nt_x - mid_eyes_x, nt_y - mid_eyes_y
+        dm_x, dm_y = mid_mouth_x - mid_eyes_x, mid_mouth_y - mid_eyes_y
+
+        yaw_nose = (dn_x * ux + dn_y * uy) / dist_yeux
+        yaw_mouth = (dm_x * ux + dm_y * uy) / dist_yeux
+        yaw_err = 0.70 * abs(yaw_nose) + 0.30 * abs(yaw_mouth)
+
+        pitch_nose = (dn_x * vx + dn_y * vy) / dist_yeux
+        pitch_mouth = max(1.0, dm_x * vx + dm_y * vy)
+        ratio_vertical = (dn_x * vx + dn_y * vy) / pitch_mouth
+
+        # Plages normales face à la caméra :
+        # - yaw_err <= 0.16 (tête bien de face, pas tournée à gauche/droite)
+        # - pitch_nose dans [0.35, 0.76] (pas tête baissée sur clavier/téléphone ni levée)
+        # - ratio_vertical dans [0.42, 0.68] (proportion yeux-nez / yeux-bouche cohérente)
+        if yaw_err > 0.22 or not (0.30 <= pitch_nose <= 0.82) or not (0.38 <= ratio_vertical <= 0.74):
+            return 0.0
+
+        score_yaw = max(0.0, 1.0 - (yaw_err / 0.22))
+        score_pitch = max(0.0, 1.0 - abs(pitch_nose - 0.56) / 0.26)
+        score_vert = max(0.0, 1.0 - abs(ratio_vertical - 0.56) / 0.18)
+        return round(0.50 * score_yaw + 0.30 * score_pitch + 0.20 * score_vert, 2)
 
     # ---------------- ESCALADE SÉMANTIQUE VERS GEMMA 3 12B ----------------
 
@@ -437,13 +558,13 @@ class PerceptionEon:
 
     # ---------------- API PUBLIQUE CAPTEURS & OUTILS ----------------
 
-    def regarde_ecran_maintenant(self, tolerance_sec: float = 2.0) -> bool:
+    def regarde_ecran_maintenant(self, tolerance_sec: float = 0.45) -> bool:
         if not self.cfg.get("activer_vision_voix", True):
             return True
         if not self.camera_active:
             return False
         with self._lock_vision:
-            return (time.monotonic() - self._dernier_regard_ts) <= tolerance_sec
+            return self._visage_detecte_actuel and ((time.monotonic() - self._dernier_regard_ts) <= tolerance_sec)
 
     def decrire_etat_capteurs(self) -> str:
         with self._lock_vision:
@@ -451,7 +572,7 @@ class PerceptionEon:
             ident = ", ".join(self._personnes_identifiees) if self._personnes_identifiees else "aucune"
             objs = ", ".join(self._objets_detectes_actuels) if self._objets_detectes_actuels else "aucun objet notable"
             pos = self._position_visage_actuel or "non cadré"
-            regard = "oui" if (time.monotonic() - self._dernier_regard_ts) <= 2.0 else "non"
+            regard = "oui" if (self._visage_detecte_actuel and (time.monotonic() - self._dernier_regard_ts) <= 0.5) else "non"
 
         return (
             f"Caméra : {'ACTIVE' if self.camera_active else 'INACTIVE'} ({self.statut_camera}) | "
@@ -537,7 +658,7 @@ class PerceptionEon:
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 15)
 
-        moteur_obj = "YOLO-ONNX" if self._yolo_net is not None else "OpenCV-HOG"
+        moteur_obj = "YOLOX-Apache2" if self._yolox_net is not None else "OpenCV-HOG"
         moteur_face = "YuNet+SFace" if (self._yunet and self._sface) else "OpenCV-Face"
         self.camera_active = True
         self.statut_camera = f"active (idx {index_cam}, {moteur_obj}/{moteur_face})"
@@ -555,6 +676,7 @@ class PerceptionEon:
                     time.sleep(0.2)
                     continue
 
+                maintenant = time.monotonic()
                 frame_idx += 1
                 h_img, w_img = frame.shape[:2]
                 gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -570,7 +692,7 @@ class PerceptionEon:
                 identites: list[str] = []
                 identites_prises: set[str] = set()
                 boites_retenues: list[tuple[int, int, int, int]] = []
-                regard_resident = False
+                score_regard_frame = 0.0
                 vec_principal: np.ndarray | None = None
                 position_desc = ""
 
@@ -581,11 +703,9 @@ class PerceptionEon:
                         faces_triees = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
                         for f in faces_triees:
                             x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
-                            # Ignore les micro-détections fantômes en arrière-plan
                             if w < 55 or h < 55:
                                 continue
                             boite = (x, y, w, h)
-                            # Élimine les boîtes doublons superposées sur le même visage
                             if any(_iou_boites(boite, b_ex) > 0.35 for b_ex in boites_retenues):
                                 continue
                             boites_retenues.append(boite)
@@ -597,9 +717,15 @@ class PerceptionEon:
                                 roi = gris[max(0, y) : min(h_img, y + h), max(0, x) : min(w_img, x + w)]
                                 vec = self._extraire_signature_visage_fallback(roi) if roi.size > 0 else None
 
+                            nom_id = "Inconnu"
                             if vec is not None:
                                 nom_id, _ = self._identifier_visage(vec, identites_prises)
-                                if nom_id not in ("Inconnu", "Non calibré"):
+                                # Grâce d'identité de 2.0s pour éviter les faux "Inconnu" quand l'utilisateur tourne légèrement la tête
+                                if nom_id == "Inconnu" and self._dernier_resident_reconnu and (maintenant - self._dernier_resident_ts) <= 2.0:
+                                    nom_id = self._dernier_resident_reconnu
+                                elif nom_id not in ("Inconnu", "Non calibré"):
+                                    self._dernier_resident_reconnu = nom_id
+                                    self._dernier_resident_ts = maintenant
                                     identites_prises.add(nom_id)
                                 identites.append(nom_id)
                                 if len(boites_retenues) == 1:
@@ -612,10 +738,8 @@ class PerceptionEon:
                                 horiz = "gauche" if centre_x < 0.38 else ("droite" if centre_x > 0.62 else "centre")
                                 dist = "proche" if (w / float(w_img)) > 0.25 else "moyen"
                                 position_desc = f"{horiz}, {dist}"
-                                oeil_d_x, oeil_g_x = float(f[4]), float(f[6])
-                                centre_yeux = ((oeil_d_x + oeil_g_x) / 2.0 - x) / max(1.0, float(w))
-                                if 0.30 <= centre_yeux <= 0.70:
-                                    regard_resident = True
+                                if nom_id != "Inconnu":
+                                    score_regard_frame = self._score_regard_frontal(f)
                 else:
                     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
                     masque = cv2.inRange(
@@ -635,18 +759,23 @@ class PerceptionEon:
                         vec_principal = self._extraire_signature_visage_fallback(roi)
                         nom_id, _ = self._identifier_visage(vec_principal)
                         identites.append(nom_id)
-                        regard_resident = True
+                        score_regard_frame = 0.8 if nom_id != "Inconnu" else 0.0
                         position_desc = "centre"
+
+                # Lissage temporel + hystérésis sur l'attention visuelle
+                self._regard_ema = 0.60 * self._regard_ema + 0.40 * score_regard_frame
+                if self._visage_detecte_actuel:
+                    regard_resident = self._regard_ema >= 0.32
+                else:
+                    regard_resident = self._regard_ema >= 0.48
 
                 nb_total_personnes = max(nb_pers_corps, len(identites))
                 if nb_total_personnes > len(identites):
                     identites.extend(["Inconnu (visage masqué/dos)"] * (nb_total_personnes - len(identites)))
 
-                # Logique de sécurité Résident vs Invité vs Intrus
                 profils_valides = self._profils_visages_compatibles()
                 residents_presents = [n for n in identites if not n.startswith("Inconnu") and n != "Non calibré"]
                 inconnus_presents = [n for n in identites if n.startswith("Inconnu")]
-                maintenant = time.monotonic()
 
                 if nb_total_personnes > 0:
                     derniere_presence_ts = maintenant
@@ -701,8 +830,9 @@ class PerceptionEon:
                     if regard_resident:
                         self._dernier_regard_ts = maintenant
 
-                resume = f"{nb_total_personnes} pers. ({', '.join(identites) or 'aucune'}) | objs: {', '.join(objets_detectes) or '-'}"
-                if resume != dernier_resume_log and (maintenant - dernier_log_ts) >= 1.5:
+                regard_txt = f"OUI ({self._regard_ema:.2f})" if regard_resident else f"non ({self._regard_ema:.2f})"
+                resume = f"{nb_total_personnes} pers. ({', '.join(identites) or 'aucune'}) | regard={regard_txt}"
+                if resume != dernier_resume_log and (maintenant - dernier_log_ts) >= 1.2:
                     panels.log_perception(f"[VISION] {resume} | lum={luminosite:.0f}")
                     dernier_resume_log = resume
                     dernier_log_ts = maintenant
@@ -717,7 +847,7 @@ class PerceptionEon:
             cap.release()
             panels.log_perception("Caméra arrêtée.")
 
-    # ---------------- AUDIO, ÉCOUTE CONTINUE & WHISPER (0 MO VRAM) ----------------
+    # ---------------- AUDIO, ÉCOUTE CONTINUE & WHISPER (MIT) ----------------
 
     @staticmethod
     def _extraire_signature_voix(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
@@ -725,7 +855,7 @@ class PerceptionEon:
         trames_actives = [
             audio[i : i + taille_trame]
             for i in range(0, len(audio) - taille_trame, taille_trame)
-            if float(np.sqrt(np.mean(audio[i : i + taille_trame] ** 2))) > 0.02
+            if float(np.sqrt(np.mean(audio[i : i + taille_trame] ** 2))) > 0.005
         ]
         if len(trames_actives) < 4:
             return np.zeros(33, dtype=np.float32)
@@ -749,16 +879,6 @@ class PerceptionEon:
         norme = float(np.linalg.norm(vec))
         return vec / norme if norme > 0 else vec
 
-    @staticmethod
-    def _contient_energie_vocale(audio: np.ndarray, sr: int = 16000) -> bool:
-        """Filtre FFT rapide vérifiant que l'énergie est concentrée dans la bande vocale 300-3400 Hz."""
-        spectre = np.abs(np.fft.rfft(audio))
-        freqs = np.fft.rfftfreq(len(audio), d=1.0 / sr)
-        energie_totale = float(np.sum(spectre**2)) + 1e-9
-        masque_voix = (freqs >= 300.0) & (freqs <= 3400.0)
-        ratio_voix = float(np.sum(spectre[masque_voix] ** 2)) / energie_totale
-        return ratio_voix >= 0.38
-
     def _verifier_locuteur(self, audio: np.ndarray) -> tuple[bool, float]:
         if not self._profils_visages_compatibles() or self.profil_voix is None:
             return True, 1.0
@@ -773,26 +893,58 @@ class PerceptionEon:
         vec_voix_actuel = self._extraire_signature_voix(audio)
         sim_voix = _cosinus(self.profil_voix, vec_voix_actuel)
 
-        seuil_visage = float(self.cfg.get("seuil_visage_sface", 0.46)) if self._sface is not None else 0.78
-        if sim_visage >= seuil_visage or sim_voix >= 0.78:
-            if sim_voix >= 0.82:
+        seuil_visage = float(self.cfg.get("seuil_visage_sface", 0.45)) if self._sface is not None else 0.78
+        seuil_voix = float(self.cfg.get("seuil_voix", 0.65))
+        if sim_visage >= seuil_visage or sim_voix >= seuil_voix:
+            if sim_voix >= 0.75:
                 self.profil_voix = 0.92 * self.profil_voix + 0.08 * vec_voix_actuel
             return True, round(max(sim_visage, sim_voix), 2)
 
         return False, round(max(sim_visage, sim_voix), 2)
 
     def _charger_whisper(self):
-        if self._whisper is None and WhisperModel is not None:
-            # CPU int8 = 0 Mo de VRAM utilisé sur la carte graphique
-            taille = self.cfg.get("modele_whisper", "small")
-            threads = int(self.cfg.get("whisper_cpu_threads", 6))
-            panels.log_perception(f"Chargement Faster-Whisper ({taille}, CPU int8, 0 Mo VRAM, {threads} threads)...")
-            self._whisper = WhisperModel(taille, device="cpu", compute_type="int8", cpu_threads=threads)
-        return self._whisper
+        if self._whisper is not None or WhisperModel is None:
+            return self._whisper
 
-    @staticmethod
-    def _journaliser_ecoute_continue(texte: str, statut: str) -> None:
+        taille = str(self.cfg.get("modele_whisper", "small"))
+        threads = int(self.cfg.get("whisper_cpu_threads", 6))
+
+        try:
+            self._push_log_audio(f"[AUDIO] Init Whisper ({taille}, cache local)...")
+            self._whisper = WhisperModel(
+                taille,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=threads,
+                local_files_only=True,
+            )
+            self._whisper_erreur = ""
+            self._push_log_audio(f"[AUDIO] Faster-Whisper ({taille}) prêt.")
+            return self._whisper
+        except Exception as err_local:
+            self._push_log_audio(f"[AUDIO] Cache absent ({type(err_local).__name__}), téléchargement...")
+
+        try:
+            self._whisper = WhisperModel(
+                taille,
+                device="cpu",
+                compute_type="int8",
+                cpu_threads=threads,
+                local_files_only=False,
+            )
+            self._whisper_erreur = ""
+            self._push_log_audio(f"[AUDIO] Faster-Whisper ({taille}) téléchargé et prêt.")
+            return self._whisper
+        except Exception as err:
+            self._whisper_erreur = f"{type(err).__name__}: {err}"
+            self._push_log_audio(f"[ERREUR WHISPER] {self._whisper_erreur}")
+            return None
+
+    def _journaliser_ecoute_continue(self, texte: str, statut: str) -> None:
         if not texte:
+            return
+        # Par défaut (RGPD / usage commercial), on ne sauvegarde pas les écoutes passives sur disque
+        if statut == "passif" and not bool(self.cfg.get("journaliser_audio_passif", False)):
             return
         try:
             dossier = BASE_DIR / "captures"
@@ -804,182 +956,340 @@ class PerceptionEon:
         except OSError:
             pass
 
+    def _lister_et_choisir_micro(self) -> tuple[int | str | None, str, int]:
+        """Liste toutes les entrées audio dans les logs et choisit le meilleur périphérique."""
+        device_cfg = self.cfg.get("micro_device", None)
+        try:
+            devices = sd.query_devices()
+            entrees = [
+                f"#{idx}: {d['name']}"
+                for idx, d in enumerate(devices)
+                if d.get("max_input_channels", 0) > 0
+            ]
+            self._push_log_audio(f"[MICRO DEVICES] {' | '.join(entrees) or 'AUCUNE ENTREE'}")
+        except Exception as err:
+            self._push_log_audio(f"[MICRO DEVICES] Erreur liste : {err}")
+
+        cible = device_cfg
+        if cible is None:
+            try:
+                for idx, d in enumerate(sd.query_devices()):
+                    if d.get("max_input_channels", 0) > 0 and str(d.get("name", "")).lower() in ("pipewire", "default"):
+                        cible = idx
+                        break
+            except Exception:
+                cible = None
+
+        nom_dev = "défaut système"
+        sr_natif = 16000
+        try:
+            info = sd.query_devices(cible, kind="input")
+            if isinstance(info, dict):
+                nom_dev = str(info.get("name", nom_dev))
+                sr_natif = int(info.get("default_samplerate", 16000)) or 16000
+        except Exception:
+            pass
+
+        return cible, nom_dev, sr_natif
+
     def _boucle_micro(self) -> None:
-        if sd is None or WhisperModel is None:
-            self.statut_micro = "sounddevice ou faster-whisper absent"
-            panels.log_perception(f"{self.statut_micro} -> écoute vocale désactivée.")
-            return
-
-        modele_stt = self._charger_whisper()
-        if modele_stt is None:
-            return
-
-        sr = 16000
-        bloc_duree = 0.1
-        bloc_taille = int(sr * bloc_duree)
-        seuil_rms_min = float(self.cfg.get("seuil_micro_rms", 0.030))
-
-        # Plancher de bruit ambiant adaptatif pour résister au bruit en ville
-        bruit_ambiant_rms = seuil_rms_min * 0.6
-        tampon_parole: list[np.ndarray] = []
-        pre_buffer: list[np.ndarray] = []
-        blocs_silence = 0
-        blocs_barge_in = 0
-        en_parole = False
-        a_regarde_pendant_parole = False
-
-        def callback_audio(indata, frames, time_info, status):
-            nonlocal en_parole, blocs_silence, blocs_barge_in, tampon_parole, pre_buffer
-            nonlocal bruit_ambiant_rms, a_regarde_pendant_parole
-
-            if self.arret_global.is_set():
+        try:
+            if sd is None:
+                self.statut_micro = "sounddevice absent"
+                panels.log_audio("[AUDIO] sounddevice absent -> écoute vocale désactivée.")
+                return
+            if WhisperModel is None:
+                self.statut_micro = "faster-whisper absent"
+                panels.log_audio("[AUDIO] faster-whisper absent -> écoute vocale désactivée.")
                 return
 
-            morceau = indata[:, 0].copy()
-            rms = float(np.sqrt(np.mean(morceau**2)))
-            regarde = self.regarde_ecran_maintenant(tolerance_sec=2.0)
+            device_micro, nom_dev, sr_natif = self._lister_et_choisir_micro()
+            self._vider_logs_audio()
 
-            # Seuil dynamique qui s'adapte au bruit de fond (rue, vent, circulation)
-            seuil_dynamique = max(seuil_rms_min, bruit_ambiant_rms * 2.2)
+            threading.Thread(target=self._charger_whisper, daemon=True).start()
 
-            # Barge-in sécurisé : ne coupe JAMAIS sur un simple bruit de ville
-            if self.ia_en_cours.is_set():
-                seuil_interruption = max(seuil_rms_min * 1.8, bruit_ambiant_rms * 2.8)
-                if regarde and rms > seuil_interruption:
-                    blocs_barge_in += 1
-                    # Nécessite ~0.8s de voix soutenue + spectre vocal + locuteur reconnu
-                    if blocs_barge_in == 8 and len(tampon_parole) >= 7:
-                        extrait_test = np.concatenate(tampon_parole[-8:])
-                        if self._contient_energie_vocale(extrait_test, sr):
+            seuil_rms_min = float(self.cfg.get("seuil_micro_rms", 0.016))
+            # Pauses naturelles : 1.4s si on regarde l'écran (laisse finir les phrases), 0.9s sinon
+            pause_regard_blocs = int(float(self.cfg.get("pause_fin_phrase_regard_sec", 1.4)) * 10)
+            pause_passive_blocs = int(float(self.cfg.get("pause_fin_phrase_passive_sec", 0.9)) * 10)
+
+            sr_capture = 16000
+            try:
+                sd.check_input_settings(device=device_micro, samplerate=16000, channels=1, dtype="float32")
+            except Exception:
+                sr_capture = sr_natif
+
+            bloc_duree = 0.1
+            bloc_taille = int(sr_capture * bloc_duree)
+
+            bruit_ambiant_rms = seuil_rms_min * 0.75
+            blocs_calibration = 0
+            echantillons_calib: list[float] = []
+
+            tampon_parole: list[np.ndarray] = []
+            pre_buffer: list[np.ndarray] = []
+            blocs_silence = 0
+            blocs_barge_in = 0
+            blocs_regard_parole = 0
+            blocs_totaux_parole = 0
+            en_parole = False
+            pic_rms_seconde = 0.0
+            dernier_rms = 0.0
+            seuil_courant = seuil_rms_min
+
+            def callback_audio(indata, frames, time_info, status):
+                nonlocal en_parole, blocs_silence, blocs_barge_in, tampon_parole, pre_buffer
+                nonlocal bruit_ambiant_rms, blocs_regard_parole, blocs_totaux_parole
+                nonlocal pic_rms_seconde, dernier_rms, seuil_courant
+                nonlocal blocs_calibration, echantillons_calib
+
+                if self.arret_global.is_set():
+                    return
+
+                if status:
+                    self._push_log_audio(f"[MICRO STATUS] {status}")
+
+                morceau_brut = indata[:, 0].copy()
+                morceau = _reechantillonner_16k(morceau_brut, sr_capture)
+                rms = float(np.sqrt(np.mean(morceau**2)))
+                dernier_rms = rms
+                if rms > pic_rms_seconde:
+                    pic_rms_seconde = rms
+
+                # Calibration automatique du bruit ambiant sur les 15 premiers blocs (1.5s)
+                if blocs_calibration < 15:
+                    blocs_calibration += 1
+                    echantillons_calib.append(rms)
+                    pre_buffer.append(morceau)
+                    if len(pre_buffer) > 8:
+                        pre_buffer.pop(0)
+                    if blocs_calibration == 15:
+                        bruit_ambiant_rms = float(np.percentile(echantillons_calib, 80))
+                        seuil_courant = max(seuil_rms_min, bruit_ambiant_rms * 1.65)
+                        self._push_log_audio(
+                            f"[CALIBRATION] Bruit fond={bruit_ambiant_rms:.4f} -> seuil auto={seuil_courant:.4f}"
+                        )
+                    return
+
+                regarde = self.regarde_ecran_maintenant(tolerance_sec=0.45)
+                seuil_dynamique = max(seuil_rms_min, bruit_ambiant_rms * 1.65)
+                seuil_courant = seuil_dynamique
+
+                # Barge-in sécurisé
+                if self.ia_en_cours.is_set():
+                    seuil_interruption = max(seuil_rms_min * 1.6, bruit_ambiant_rms * 2.2)
+                    if regarde and rms > seuil_interruption:
+                        blocs_barge_in += 1
+                        if blocs_barge_in == 8 and len(tampon_parole) >= 7:
+                            extrait_test = np.concatenate(tampon_parole[-8:])
                             if self.profil_voix is None:
                                 self.interruption_event.set()
                             else:
-                                sim_v = _cosinus(self.profil_voix, self._extraire_signature_voix(extrait_test, sr))
-                                if sim_v >= 0.72:
+                                sim_v = _cosinus(self.profil_voix, self._extraire_signature_voix(extrait_test, 16000))
+                                if sim_v >= 0.65:
                                     self.interruption_event.set()
+                    else:
+                        blocs_barge_in = 0
                 else:
                     blocs_barge_in = 0
-            else:
-                blocs_barge_in = 0
 
-            if not en_parole:
-                # Mise à jour lente du niveau de bruit ambiant quand personne ne parle
-                bruit_ambiant_rms = 0.96 * bruit_ambiant_rms + 0.04 * min(rms, 0.15)
-                pre_buffer.append(morceau)
-                if len(pre_buffer) > 4:
-                    pre_buffer.pop(0)
+                if not en_parole:
+                    bruit_ambiant_rms = 0.94 * bruit_ambiant_rms + 0.06 * rms
+                    pre_buffer.append(morceau)
+                    if len(pre_buffer) > 8:
+                        pre_buffer.pop(0)
 
-                # On capture TOUTE parole détectée (même sans regard) pour la transcription continue
-                if rms > seuil_dynamique:
-                    en_parole = True
-                    blocs_silence = 0
-                    a_regarde_pendant_parole = regarde
-                    tampon_parole = list(pre_buffer)
-            else:
-                tampon_parole.append(morceau)
-                if regarde:
-                    a_regarde_pendant_parole = True
-
-                if rms > seuil_dynamique * 0.85:
-                    blocs_silence = 0
+                    if rms > seuil_dynamique:
+                        en_parole = True
+                        blocs_silence = 0
+                        blocs_totaux_parole = 1
+                        blocs_regard_parole = 1 if regarde else 0
+                        tampon_parole = list(pre_buffer)
+                        self._push_log_audio(
+                            f"[MICRO] Parole détectée (RMS={rms:.4f} > {seuil_dynamique:.4f} | regard={'OUI' if regarde else 'non'})"
+                        )
                 else:
-                    blocs_silence += 1
+                    tampon_parole.append(morceau)
+                    blocs_totaux_parole += 1
+                    if regarde:
+                        blocs_regard_parole += 1
 
-                if blocs_silence >= 8 or len(tampon_parole) >= 160:
-                    audio_complet = np.concatenate(tampon_parole)
-                    regarde_segment = a_regarde_pendant_parole
-                    en_parole = False
-                    blocs_silence = 0
-                    tampon_parole = []
-                    pre_buffer = []
-                    a_regarde_pendant_parole = False
+                    # Seuil de maintien plus bas (0.55x) pour ne pas couper sur les fins de mots
+                    if rms > seuil_dynamique * 0.55:
+                        blocs_silence = 0
+                    else:
+                        blocs_silence += 1
 
-                    if (
-                        len(audio_complet) >= int(sr * 0.7)
-                        and self._contient_energie_vocale(audio_complet, sr)
-                        and self._transcriptions_en_attente < 2
-                    ):
+                    cible_silence = pause_regard_blocs if (regarde or blocs_regard_parole >= 3) else pause_passive_blocs
+
+                    if blocs_silence >= cible_silence or len(tampon_parole) >= 180:
+                        sature_duree = len(tampon_parole) >= 180
+                        # On retire l'excédent de silence de fin tout en gardant 2 blocs (0.2s) de marge
+                        a_retirer = max(0, blocs_silence - 2)
+                        tranches = tampon_parole[:-a_retirer] if a_retirer > 0 and a_retirer < len(tampon_parole) else tampon_parole
+                        audio_complet = np.concatenate(tranches)
+
+                        ratio_regard = blocs_regard_parole / float(max(1, blocs_totaux_parole))
+                        regard_segment = (blocs_regard_parole >= 4) and (ratio_regard >= 0.25)
+                        duree_sec = len(audio_complet) / 16000.0
+                        rms_moy = float(np.sqrt(np.mean(audio_complet**2)))
+
+                        en_parole = False
+                        blocs_silence = 0
+                        blocs_regard_parole = 0
+                        blocs_totaux_parole = 0
+                        tampon_parole = []
+                        pre_buffer = []
+
+                        if sature_duree:
+                            bruit_ambiant_rms = max(bruit_ambiant_rms, rms_moy * 1.1)
+                            self._push_log_audio(
+                                f"[CALIBRATION] Bruit ambiant ajusté à {bruit_ambiant_rms:.4f}"
+                            )
+
+                        if duree_sec < 0.50:
+                            return
+
+                        if self._whisper is None:
+                            raison = self._whisper_erreur or "modèle en cours de chargement"
+                            self._push_log_audio(f"[AUDIO] Parole ({duree_sec:.1f}s) ignorée : {raison}")
+                            return
+
+                        if self._transcriptions_en_attente >= 2:
+                            self._push_log_audio("[MICRO] File Whisper pleine, segment ignoré.")
+                            return
+
+                        self._push_log_audio(
+                            f"[MICRO] Transcription ({duree_sec:.2f}s, regard={ratio_regard:.0%})..."
+                        )
                         self._transcriptions_en_attente += 1
                         threading.Thread(
                             target=self._traiter_segment_audio,
-                            args=(audio_complet, regarde_segment),
+                            args=(audio_complet, regard_segment),
                             daemon=True,
                         ).start()
 
-        try:
-            with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=bloc_taille, callback=callback_audio):
+            with sd.InputStream(
+                samplerate=sr_capture,
+                channels=1,
+                dtype="float32",
+                blocksize=bloc_taille,
+                device=device_micro,
+                callback=callback_audio,
+            ):
                 self.micro_actif = True
-                self.statut_micro = "actif (écoute continue CPU + mot-clé Éon/regard)"
-                panels.log_perception("Écoute continue CPU active (déclenchement par regard ou mot-clé « Éon »).")
+                self.statut_micro = f"actif ({nom_dev} @ {sr_capture}Hz)"
+                panels.log_audio(f"Micro ouvert : {nom_dev} ({sr_capture}Hz, calibration 1.5s...)")
+
                 while not self.arret_global.is_set():
-                    time.sleep(0.2)
+                    self._vider_logs_audio()
+                    if blocs_calibration < 15:
+                        panels.maj_vu_micro("Calibration bruit ambiant en cours...")
+                    else:
+                        etat = "PAROLE" if en_parole else "écoute"
+                        vu = _barre_vu(dernier_rms, echelle=max(0.05, seuil_courant * 3.5))
+                        panels.maj_vu_micro(
+                            f"{vu} RMS:{dernier_rms:.4f} (pic:{pic_rms_seconde:.4f} / seuil:{seuil_courant:.4f}) [{etat}]"
+                        )
+                    pic_rms_seconde *= 0.85
+                    time.sleep(0.15)
         except Exception as err:
             self.micro_actif = False
-            self.statut_micro = f"erreur ({err})"
-            panels.log_perception(f"Erreur flux micro ({err}) -> mode clavier uniquement.")
+            self.statut_micro = f"erreur ({type(err).__name__}: {err})"
+            detail = traceback.format_exc().strip().splitlines()[-1]
+            panels.maj_vu_micro("Micro : ERREUR")
+            panels.log_audio(f"[ERREUR MICRO] {detail}")
 
     def _traiter_segment_audio(self, audio: np.ndarray, a_regarde: bool) -> None:
         try:
+            if self._whisper is None:
+                return
             with self._lock_whisper:
-                segments, _ = self._whisper.transcribe(
-                    audio,
-                    language="fr",
-                    beam_size=2,
-                    condition_on_previous_text=False,
-                    no_speech_threshold=0.60,
-                    log_prob_threshold=-0.80,
-                    compression_ratio_threshold=2.2,
-                    vad_filter=True,
-                    vad_parameters={
-                        "threshold": 0.58,
-                        "min_speech_duration_ms": 250,
-                        "min_silence_duration_ms": 450,
-                    },
-                )
-                morceaux_valides = []
-                prob_silence_min = 1.0
-                for seg in segments:
-                    prob_silence_min = min(prob_silence_min, float(getattr(seg, "no_speech_prob", 0.0)))
-                    if getattr(seg, "no_speech_prob", 0.0) > 0.50:
-                        continue
-                    if getattr(seg, "avg_logprob", 0.0) < -0.80:
-                        continue
-                    morceaux_valides.append(seg.text.strip())
+                old_out, old_err = sys.stdout, sys.stderr
+                try:
+                    if sys.__stdout__ is not None:
+                        sys.stdout = sys.__stdout__
+                    if sys.__stderr__ is not None:
+                        sys.stderr = sys.__stderr__
+
+                    segments, _ = self._whisper.transcribe(
+                        audio,
+                        language="fr",
+                        initial_prompt="Conversation vocale en français avec l'assistant Éon.",
+                        beam_size=5,
+                        temperature=0.0,
+                        condition_on_previous_text=False,
+                        no_speech_threshold=0.65,
+                        log_prob_threshold=-0.85,
+                        compression_ratio_threshold=2.2,
+                        vad_filter=True,
+                        vad_parameters={
+                            "threshold": 0.45,
+                            "min_speech_duration_ms": 200,
+                            "min_silence_duration_ms": 350,
+                            "speech_pad_ms": 200,
+                        },
+                    )
+                    morceaux_bruts = []
+                    morceaux_valides = []
+                    prob_silence_min = 1.0
+                    for seg in segments:
+                        txt_seg = seg.text.strip()
+                        nsp = float(getattr(seg, "no_speech_prob", 0.0))
+                        alp = float(getattr(seg, "avg_logprob", 0.0))
+                        prob_silence_min = min(prob_silence_min, nsp)
+                        if txt_seg:
+                            morceaux_bruts.append(txt_seg)
+                        if nsp <= 0.60 and alp >= -0.85:
+                            morceaux_valides.append(txt_seg)
+                finally:
+                    sys.stdout, sys.stderr = old_out, old_err
+
+                texte_brut = " ".join(morceaux_bruts).strip()
                 texte = " ".join(morceaux_valides).strip()
         except Exception as err:
-            panels.log_perception(f"Erreur transcription : {err}")
+            self._push_log_audio(f"[WHISPER ERREUR] {type(err).__name__}: {err}")
             return
         finally:
             self._transcriptions_en_attente = max(0, self._transcriptions_en_attente - 1)
 
-        if len(texte) < 3 or texte.lower().strip(" !?.,") in BRUITS_PARASITES_WHISPER:
+        if not texte_brut:
+            self._push_log_audio("[WHISPER] (silence / bruit non verbal)")
             return
 
-        # Vérifie si le mot-clé "Éon" a été prononcé ou si l'utilisateur regardait l'écran
+        self._push_log_audio(f"[WHISPER] « {texte_brut} » (ns={prob_silence_min:.2f})")
+
+        texte_norm = texte.lower().strip(" !?.,;:")
+        if (
+            len(texte) < 2
+            or texte_norm in BRUITS_PARASITES_WHISPER
+            or any(sub in texte_norm for sub in HALLUCINATIONS_SUBSTRINGS)
+        ):
+            return
+
         contient_eon = bool(REGEX_WAKE_WORD.search(texte))
-        doit_repondre = a_regarde or contient_eon
+        toujours_repondre = bool(self.cfg.get("repondre_sans_mot_cle", False))
+        doit_repondre = a_regarde or contient_eon or toujours_repondre
 
         if not doit_repondre:
-            panels.log_perception(f"[ENTENDU - passif] {texte}")
+            self._push_log_audio(f"[PASSIF] {texte}")
             self._journaliser_ecoute_continue(texte, "passif")
             return
 
-        # Si l'utilisateur a dit "Éon" pendant que l'IA parlait, on l'interrompt proprement
         if self.ia_en_cours.is_set() and contient_eon:
             self.interruption_event.set()
 
         autorise, conf = self._verifier_locuteur(audio)
         if not autorise and not contient_eon:
-            panels.log_perception(f"[ENTENDU - locuteur inconnu conf={conf:.2f}] {texte}")
+            self._push_log_audio(f"[IGNORÉ locuteur={conf:.2f}] {texte}")
             self._journaliser_ecoute_continue(texte, f"ignore_locuteur:{conf:.2f}")
             return
 
-        # Calibration initiale prudente uniquement si regard actif et audio propre
         if (
             a_regarde
             and (not self._profils_visages_compatibles() or self.profil_voix is None)
-            and len(audio) >= int(16000 * 1.4)
-            and prob_silence_min < 0.25
+            and len(audio) >= int(16000 * 1.0)
+            and prob_silence_min < 0.35
         ):
             with self._lock_vision:
                 vec_v = self._dernier_vecteur_visage.copy() if self._dernier_vecteur_visage is not None else None
@@ -987,13 +1297,12 @@ class PerceptionEon:
                 self.profils_visages["Bryan"] = vec_v
                 self.profil_voix = self._extraire_signature_voix(audio)
                 self._sauvegarder_profil()
-                panels.log_perception("Profil biométrique initial calibré (Bryan).")
+                self._push_log_audio("[BIOMÉTRIE] Profil calibré (Bryan).")
 
         motif_declenchement = "mot-clé Éon" if contient_eon and not a_regarde else ("regard+Éon" if contient_eon else "regard")
         self.pret_pour_saisie.clear()
-        panels.log_perception(f"[VOIX -> EON | {motif_declenchement} | conf={conf:.2f}] {texte}")
+        self._push_log_audio(f"[VOIX -> EON | {motif_declenchement}] {texte}")
         self._journaliser_ecoute_continue(texte, f"actif:{motif_declenchement}")
-        panels.ecrire_chat(f"\nVous (voix) : {texte}")
         self.file_messages.put(MessageEntrant(texte=texte, source="voix", confiance_locuteur=conf))
 
     # ---------------- CLAVIER FALLBACK (SI TEXTUAL INACTIF) ----------------
