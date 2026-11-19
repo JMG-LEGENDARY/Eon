@@ -1,0 +1,6 @@
+ddgs
+faster-whisper
+numpy
+ollama
+opencv-python
+sounddevice

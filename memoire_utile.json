@@ -1,0 +1,26 @@
+{
+  "identite": {
+    "valeur": "Bryan",
+    "maj": "2026-11-18T23:14:30"
+  },
+  "localisation": {},
+  "preferences": {},
+  "materiel_projets": {},
+  "quotidien": {},
+  "os_version": {
+    "valeur": "7.3.3-200.fc44.x86_64",
+    "maj": "2026-11-17T21:52:28"
+  },
+  "architecture": {
+    "valeur": "x86_64",
+    "maj": "2026-11-17T21:52:28"
+  },
+  "python_version": {
+    "valeur": "3.14.10",
+    "maj": "2026-11-17T21:52:28"
+  },
+  "current_directory": {
+    "valeur": "/home/jmg/Documents/MOI/IA",
+    "maj": "2026-11-17T21:52:28"
+  }
+}
