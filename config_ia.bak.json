@@ -11,7 +11,10 @@
     "seuils": {
       "confiance": 0.54,
       "marge": 0.03,
-      "insatisfaction": 0.62
+      "insatisfaction": 0.62,
+      "confiance_directe": 0.63,
+      "marge_directe": 0.05,
+      "intention_outil": 0.58
     },
     "mots_cles_lourds": [
       "architecture",
@@ -48,7 +51,9 @@
       }
     ],
     "pattern_continuation_action": "^(fais[- ]le|fais[- ]la|ex[ée]cute([- ]le|-la)?|lance([- ]le|-la)?|vas[- ]y|essaie|teste|appliques?[- ]le)[!?.…\\s]*$",
-    "pattern_rupture_relance": "^(lis|lire|affiche|montre|liste|cherche|modifie|crée|ex[ée]cute|lance|quel\\s+mod[èe]le|quelle\\s+ia|qui\\s+peut|qu'est-ce\\s+que\\s+tu\\s+peux)\\b"
+    "pattern_rupture_relance": "^(lis|lire|affiche|montre|liste|cherche|modifie|crée|ex[ée]cute|lance|quel\\s+mod[èe]le|quelle\\s+ia|qui\\s+peut|qu'est-ce\\s+que\\s+tu\\s+peux)\\b",
+    "superviseur_model": "qwen3:0.6b",
+    "utiliser_superviseur_ia": true
   },
   "signaux": {
     "consentement_oui": [
@@ -134,7 +139,7 @@
       "expertise": "Discussion libre, humour, brainstorming, ton naturel sans filtre ni rigidité.",
       "temperature": 0.8,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 512,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,
@@ -152,7 +157,7 @@
       "expertise": "Culture générale, explications théoriques, synthèse, recherche Internet et mémoire utilisateur.",
       "temperature": 0.25,
       "num_ctx": 8192,
-      "num_predict": null,
+      "num_predict": 768,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,
@@ -169,7 +174,7 @@
       "expertise": "Administration système Linux/Fedora, commandes terminal bash, lecture/édition de fichiers locaux, scripts Python/Rust/C.",
       "temperature": 0.15,
       "num_ctx": 8192,
-      "num_predict": null,
+      "num_predict": 1024,
       "web_tools": true,
       "file_tools": true,
       "shell_tools": true,
@@ -185,7 +190,7 @@
       "expertise": "Refactoring complexe multi-fichiers, architecture logicielle lourde et debugging bas niveau (plus lent, sollicite le CPU).",
       "temperature": 0.15,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 1536,
       "web_tools": true,
       "file_tools": true,
       "shell_tools": true,
@@ -200,7 +205,7 @@
       "expertise": "Reformulation de textes brouillons, extraction d'intentions complexes ou dictées vocales mal structurées.",
       "temperature": 0.3,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 512,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,

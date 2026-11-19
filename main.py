@@ -1,1008 +1,741 @@
-import base64
+import datetime
+import inspect
 import json
-import platform
 import re
-import sys
-import time
+import threading
 import uuid
-from datetime import datetime
+from typing import Any, Callable
+
 import ollama
 
-import file_tools
-import shell_tools
 import terminal_panels as panels
-from file_tools import (
-    chercher_dans_fichiers,
-    ecrire_fichier,
-    lire_fichier,
-    lister_fichiers,
-    modifier_fichier,
-)
 from memory_manager import (
     BASE_DIR,
-    charger_memoire_rapide,
-    charger_memoire_utile,
     consulter_historique,
-    effacer_historique_jour,
-    effacer_tout_historique,
+    exporter_historique,
     formater_contexte_memoire,
     journaliser_echange,
     marquer_dernier_echange_echec,
     memoriser_fait_utilisateur,
-    supprimer_fait_utilisateur,
+    rechercher_dans_historique,
 )
-from optimizer import executer_optimisation_nocturne
-from perception_eon import PerceptionEon
+from perception_eon import MessageEntrant, PerceptionEon
 from router import RouteurAutonome
-from shell_tools import (
-    arreter_tache_en_cours,
-    executer_commande_shell,
-    obtenir_tache_en_cours,
-    statut_tache_en_cours,
-)
-from web_tools import lire_page_web, rechercher_sur_internet
 
-MAX_ETAPES_AGENT = 12
-MAX_TRANSFERTS_TOUR = 2
-NB_SORTIES_OUTILS_COMPLETES = 2
+try:
+    from context_compressor import GestionnaireContexteMultiNiveaux
+except ImportError:
+    GestionnaireContexteMultiNiveaux = None
 
-REGEX_BALISE_WEB_FALLBACK = re.compile(r"\[DEMANDE_WEB\s*:\s*(.+?)\]", re.IGNORECASE)
-REGEX_BALISE_TRANSFERT_FALLBACK = re.compile(r"\[TRANSFERT\s*:\s*([^\|\]]+)\|\s*(.+?)\]", re.IGNORECASE)
-REGEX_PROPOSITION_WEB_TEXTE = re.compile(
-    r"(chercher|rechercher|vérifier|aller|regarder|consulter).{0,35}(internet|en ligne|web|google)",
-    re.IGNORECASE,
-)
-# Questions visuelles fines nécessitant réellement gemma3:12b-it-qat (couleur, texte, sens d'une scène)
-REGEX_VISION_COMPLEXE = re.compile(
-    r"\b(quelle\s+couleur|couleur\s+(de|du|le|des)|t-?shirt|pull|sweat|v[êe]tement|tenue|"
-    r"lis\s+(ce|la|le|ceci|ça)|[ée]crit\s+sur|analyse\s+(l'image|la\s+sc[èe]ne|ce\s+que\s+tu\s+vois)|"
-    r"d[ée]cris\s+(pr[ée]cis[ée]ment|ce\s+que\s+tu\s+vois|l'image))\b",
-    re.IGNORECASE,
-)
-REGEX_CAPTURE_PHOTO = re.compile(
-    r"\b(capture\s+(de\s+)?(la\s+)?cam[ée]ra|prends?\s+une?\s+photo|capture\s+photo|enregistre\s+l'image)\b",
-    re.IGNORECASE,
-)
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
-_PERCEPTION_ACTIVE: PerceptionEon | None = None
+try:
+    import web_tools
+except ImportError:
+    web_tools = None
 
+try:
+    import file_tools
+except ImportError:
+    file_tools = None
 
-def observer_camera(question: str = "Décris précisément tout ce que tu vois devant la caméra.") -> str:
-    """Analyse sémantique approfondie de l'image caméra via gemma3:12b-it-qat.
+try:
+    import shell_tools
+except ImportError:
+    shell_tools = None
 
-    Args:
-        question: Ce qu'il faut analyser ou vérifier sur l'image de la caméra.
-    """
-    if _PERCEPTION_ACTIVE is None:
-        return "Capteurs non initialisés."
-    return _PERCEPTION_ACTIVE.observer_camera(question)
+try:
+    import optimizer
+except ImportError:
+    optimizer = None
 
 
-def capturer_photo_camera(nom_fichier: str = "") -> str:
-    """Prend une capture photo avec la webcam et l'enregistre sur le disque.
-
-    Args:
-        nom_fichier: Nom optionnel du fichier image (ex: 'test.jpg').
-    """
-    if _PERCEPTION_ACTIVE is None:
-        return "Capteurs non initialisés."
-    return _PERCEPTION_ACTIVE.capturer_photo(nom_fichier)
-
-
-def inspecter_systeme() -> str:
-    """Retourne les informations réelles sur l'OS, la machine, le dossier courant et l'équipe de modèles."""
-    cfg = json.loads((BASE_DIR / "config_ia.json").read_text(encoding="utf-8"))
-    lignes = [
-        f"OS réel : {platform.system()} {platform.release()} ({platform.platform()})",
-        f"Architecture : {platform.machine()} | Python : {platform.python_version()}",
-        f"Répertoire projet : {BASE_DIR}",
-        "Équipe de modèles disponibles :",
-    ]
-    for nom, info in cfg.get("routes", {}).items():
-        caps = []
-        if info.get("web_tools"):
-            caps.append("Internet")
-        if info.get("file_tools"):
-            caps.append("Fichiers locaux")
-        if info.get("shell_tools"):
-            caps.append("Terminal bash")
-        lignes.append(
-            f"- @{info.get('alias', '?')} ({nom}) : {info.get('expertise', info.get('role'))} "
-            f"[Outils: {', '.join(caps) or 'aucun'}]"
-        )
-    return "\n".join(lignes)
-
-
-def transferer_tache(modele_cible: str, raison: str, consigne_transmise: str) -> str:
-    """Délègue la tâche en cours à un autre modèle de l'équipe plus qualifié ou disposant des outils requis."""
-    return f"TRANSFERT_DEMANDE|{modele_cible}|{raison}|{consigne_transmise}"
-
-
-OUTILS_WEB_LISTE = [rechercher_sur_internet, lire_page_web]
-OUTILS_FICHIERS_LISTE = [lister_fichiers, lire_fichier, chercher_dans_fichiers, modifier_fichier, ecrire_fichier]
-OUTILS_SHELL_LISTE = [executer_commande_shell, statut_tache_en_cours, arreter_tache_en_cours]
-OUTILS_BASE_LISTE = [
-    consulter_historique,
-    memoriser_fait_utilisateur,
-    inspecter_systeme,
-    transferer_tache,
-    observer_camera,
-    capturer_photo_camera,
-]
-NOMS_OUTILS_WEB = {fn.__name__ for fn in OUTILS_WEB_LISTE}
-MAP_TOUS_OUTILS = {
-    fn.__name__: fn for fn in [*OUTILS_WEB_LISTE, *OUTILS_FICHIERS_LISTE, *OUTILS_SHELL_LISTE, *OUTILS_BASE_LISTE]
+MODELES_LOURDS_GPU = {
+    "gemma3:12b-it-qat",
+    "qwen2.5-coder:14b",
+    "qwen2.5-coder:7b",
+    "qwen2.5:7b",
+    "huihui_ai/qwen3-abliterated:8b",
 }
 
+OUTILS_SENSIBLES_FICHIERS = {"ecrire_fichier", "modifier_fichier", "supprimer_fichier", "deplacer_fichier"}
+OUTILS_SENSIBLES_SHELL = {"executer_commande_shell"}
 
-class OrchestrateurAgent:
-    def __init__(self) -> None:
-        self.routeur = RouteurAutonome()
-        self.modele_verrouille: str | None = None
-        self.web_preautorise_tour = False
-        self.perception: PerceptionEon | None = None
-        file_tools.CALLBACK_CONFIRMATION = self.demander_autorisation_fichier
-        shell_tools.CALLBACK_CONFIRMATION = self.demander_autorisation_shell
-        self._synchroniser_modes_outils()
 
-    def _synchroniser_modes_outils(self) -> None:
-        file_tools.MODE_FICHIERS = self.routeur.config.get("file_mode", "ask")
-        shell_tools.MODE_SHELL = self.routeur.config.get("shell_mode", "ask")
+def _log_outil(message: str) -> None:
+    if hasattr(panels, "log_outil"):
+        panels.log_outil(message)
+    elif hasattr(panels, "log_perception"):
+        panels.log_perception(message)
 
-    def verifier_hot_reload(self) -> None:
-        if self.routeur.verifier_hot_reload():
-            self._synchroniser_modes_outils()
 
-    def _demander_saisie_bloquee(self, invite: str) -> str:
-        etait_actif = bool(self.perception and self.perception.ia_en_cours.is_set())
-        if etait_actif and self.perception is not None:
-            self.perception.ia_en_cours.clear()
-            time.sleep(0.05)
-        try:
-            return panels.saisir(invite).strip()
-        except (KeyboardInterrupt, EOFError):
-            return ""
-        finally:
-            if etait_actif and self.perception is not None:
-                self.perception.ia_en_cours.set()
-
-    def demander_autorisation_web(self, modele: str, action: str, cible: str) -> bool:
-        mode = self.routeur.config.get("web_mode", "ask")
-        if mode == "off":
-            panels.ecrire_chat("\n  [Web bloqué] Accès Internet désactivé (/web off).")
-            return False
-        if mode == "auto" or self.web_preautorise_tour:
-            panels.log_outil(f"[Web auto] {action} : {cible}")
-            return True
-
-        panels.ecrire_chat(f"\n  [Autorisation Web] {modele} souhaite {action} : « {cible} »")
-        rep = self._demander_saisie_bloquee("Autoriser l'accès à Internet ? [o/N] : ")
-        autorise, detail = self.routeur.interpreter_consentement(rep)
-        panels.ecrire_chat(f"  [Verdict : {'AUTORISÉ' if autorise else 'REFUSÉ'} | {detail}]")
-        return autorise
-
-    def demander_autorisation_fichier(self, action: str, detail_diff: str) -> bool:
-        panels.ecrire_chat(f"\n  [Autorisation Fichier] {action}\n{detail_diff}\n")
-        rep = self._demander_saisie_bloquee("Appliquer cette modification sur le disque ? [o/N] : ")
-        autorise, detail = self.routeur.interpreter_consentement(rep)
-        panels.ecrire_chat(f"  [Verdict Fichier : {'AUTORISÉ' if autorise else 'REFUSÉ'} | {detail}]")
-        return autorise
-
-    def demander_autorisation_shell(self, commande_affichee: str) -> bool:
-        panels.ecrire_chat(f"\n  [Autorisation Terminal] {commande_affichee}")
-        rep = self._demander_saisie_bloquee("Exécuter cette commande ? [o/N] : ")
-        autorise, detail = self.routeur.interpreter_consentement(rep)
-        panels.ecrire_chat(f"  [Verdict Terminal : {'AUTORISÉ' if autorise else 'REFUSÉ'} | {detail}]")
-        return autorise
-
-    def _annuaire_equipe(self, modele_courant: str) -> str:
-        lignes = []
-        for nom, cfg in self.routeur.config.get("routes", {}).items():
-            if nom == modele_courant or cfg.get("role") in ("phatique", "vision_multimodale"):
-                continue
-            caps = []
-            if cfg.get("shell_tools"):
-                caps.append("Terminal bash")
-            if cfg.get("file_tools"):
-                caps.append("Fichiers")
-            if cfg.get("web_tools"):
-                caps.append("Web")
-            lignes.append(
-                f"- @{cfg.get('alias')} ({nom}) : {cfg.get('expertise', cfg.get('role'))} "
-                f"[Capacités : {', '.join(caps) or 'dialogue'}]"
-            )
-        return "\n".join(lignes)
-
-    def _liste_outils_route(self, route_cfg: dict) -> list:
-        if route_cfg.get("role") in ("phatique", "vision_multimodale"):
-            return []
-        outils = list(OUTILS_BASE_LISTE)
-        if route_cfg.get("web_tools", False) and self.routeur.config.get("web_mode", "ask") != "off":
-            outils.extend(OUTILS_WEB_LISTE)
-        if route_cfg.get("file_tools", False):
-            outils.extend(OUTILS_FICHIERS_LISTE)
-        if route_cfg.get("shell_tools", False) and self.routeur.config.get("shell_mode", "ask") != "off":
-            outils.extend(OUTILS_SHELL_LISTE)
-        return outils
-
-    def construire_system_prompt(self, modele: str, route_cfg: dict, mode_fallback_texte: bool = False) -> dict[str, str]:
-        role = route_cfg.get("role", "")
-        if role == "phatique":
-            return {
-                "role": "system",
-                "content": (
-                    "Tu es Eon. Tutoie l'utilisateur. Réponds de façon très courte, détendue et naturelle en français (1 phrase). "
-                    "Ne dis jamais « Je suis là pour vous assister » ni « Quel est votre besoin ? »."
-                ),
-            }
-
-        date_actuelle = datetime.now().strftime("%A %d %B %Y, %H:%M")
-        a_fichiers = route_cfg.get("file_tools", False)
-        a_shell = route_cfg.get("shell_tools", False) and self.routeur.config.get("shell_mode", "ask") != "off"
-        a_web = route_cfg.get("web_tools", False) and self.routeur.config.get("web_mode", "ask") != "off"
-
-        ton = (
-            "Tu es Eon, un pote intelligent, détendu et naturel. Tutoie toujours l'utilisateur. Parle comme un vrai humain, jamais comme un centre d'appel."
-            if role == "creatif_discussion"
-            else "Tu es Eon, un assistant technique franc, naturel et autonome. Tutoie toujours l'utilisateur. Va droit au but sans blabla final."
-        )
-
-        regles = [
-            f"Nom : Eon | Moteur actif : {modele} (@{route_cfg.get('alias')}) | Date : {date_actuelle} | Langue : français.",
-            ton,
-            "Règle d'honnêteté & Vision : N'invente JAMAIS un fait, une couleur, un vêtement, un objet ou le résultat d'une commande. "
-            "Tu disposes déjà des détections temps réel (personnes identifiées, objets visibles) dans `ÉTAT DES CAPTEURS`. "
-            "Si l'utilisateur demande une analyse visuelle fine (couleur, texte, sens d'une image), appelle `observer_camera`.",
-        ]
-
-        if a_fichiers or a_shell:
-            regles.append(
-                f"OUTILS LOCAUX ACTIFS (dossier : {BASE_DIR}, OS : Fedora Linux) : "
-                "Tu as un accès réel aux outils locaux (`executer_commande_shell`, `statut_tache_en_cours`, `arreter_tache_en_cours`, `lister_fichiers`, `lire_fichier`, `modifier_fichier`, `ecrire_fichier`). "
-                "Appelle-les VRAIMENT via `tool_calls`. INTERDIT ABSOLU de simuler une commande (`[simulé]`) ou de prétendre ne pas avoir accès au terminal. "
-                "Pour une mise à jour Fedora, appelle `executer_commande_shell(commande='sudo dnf upgrade -y')` sans demander le mot de passe dans le chat."
-            )
-        else:
-            regles.append(
-                "LIMITES DE TES OUTILS : Tu n'as PAS d'accès au terminal bash ni aux fichiers locaux. "
-                "Ne simule JAMAIS une commande et ne prétends jamais pouvoir l'exécuter toi-même."
-            )
-
-        if a_web:
-            txt_web = "Tu disposes de `rechercher_sur_internet` et `lire_page_web`."
-            if mode_fallback_texte:
-                txt_web += " Pour chercher en ligne, réponds UNIQUEMENT : [DEMANDE_WEB: requête]."
-            regles.append(txt_web)
-
-        annuaire = self._annuaire_equipe(modele)
-        if annuaire:
-            instruction_transfert = (
-                "AUTONOMIE & DÉLÉGATION : Si la demande sort de ton domaine d'expertise ou exige un outil que tu n'as pas "
-                "(ex: exécuter une commande shell, éditer un fichier, architecture lourde, discussion créative), "
-                "explique brièvement pourquoi tu ne peux pas le faire seul et appelle IMMÉDIATEMENT `transferer_tache` vers le spécialiste adapté :\n"
-                f"{annuaire}"
-            )
-            if mode_fallback_texte:
-                instruction_transfert += "\nSi tu n'as pas d'appels de fonctions, réponds UNIQUEMENT : [TRANSFERT: alias_cible | raison et consigne]."
-            regles.append(instruction_transfert)
-
-        regles_apprises = self.routeur.config.get("regles_apprises", [])
-        if regles_apprises:
-            regles.append("Consignes apprises :\n" + "\n".join(f"- {r}" for r in regles_apprises))
-
-        if self.perception is not None:
-            regles.append(f"ÉTAT DES CAPTEURS : {self.perception.decrire_etat_capteurs()}")
-
-        bloc_memoire = formater_contexte_memoire()
-        if bloc_memoire:
-            regles.append(f"\n{bloc_memoire}")
-
-        return {"role": "system", "content": "\n".join(regles)}
-
-    @staticmethod
-    def _compresser_historique_outils(messages: list[dict], garder_recents: int = NB_SORTIES_OUTILS_COMPLETES) -> None:
-        indices_outils = [i for i, m in enumerate(messages) if m.get("role") == "tool"]
-        if len(indices_outils) <= garder_recents:
-            return
-        for idx in indices_outils[:-garder_recents]:
-            contenu = str(messages[idx].get("content", ""))
-            if len(contenu) > 350:
-                messages[idx]["content"] = (
-                    f"{contenu[:220].rstrip()}\n... [sortie outil condensée ({len(contenu)} car.)] ...\n{contenu[-100:].lstrip()}"
-                )
-
-    def _appel_stream_ollama(
-        self,
-        modele: str,
-        messages: list,
-        outils: list | None,
-        options: dict,
-        interruption_event=None,
-        keep_alive: str | int = "4m",
-    ):
-        kwargs = {
-            "model": modele,
-            "messages": messages,
-            "tools": outils,
-            "stream": True,
-            "options": options,
-            "keep_alive": keep_alive,
-        }
-        if "qwen3" in modele.lower():
-            try:
-                stream = ollama.chat(**kwargs, think=False)
-            except TypeError:
-                stream = ollama.chat(**kwargs)
-        else:
-            stream = ollama.chat(**kwargs)
-
-        for chunk in stream:
-            if interruption_event is not None and interruption_event.is_set():
-                try:
-                    stream.close()
-                except Exception:
-                    pass
-                break
-            yield chunk
-
-    def _generer_bilan_arret(
-        self,
-        modele: str,
-        messages: list[dict],
-        options: dict,
-        motif: str,
-        interruption_event=None,
-    ) -> str:
-        panels.ecrire_chat(f"\n  [Agent -> {motif}. Génération du bilan...]\n")
-        self._compresser_historique_outils(messages)
-        messages.append({
-            "role": "user",
-            "content": (
-                f"[ARRÊT AUTOMATIQUE : {motif}]\n"
-                "Tu n'as plus d'outils pour ce tour. Résume brièvement : 1) ce qui a été fait, 2) ce qui bloque, 3) la suite conseillée."
-            ),
-        })
-        texte = ""
-        for chunk in self._appel_stream_ollama(modele, messages, None, options, interruption_event=interruption_event):
-            morceau = chunk.get("message", {}).get("content", "")
-            if morceau:
-                panels.ecrire_chat(morceau, fin="")
-                texte += morceau
-        panels.flush_chat()
-        panels.ecrire_chat("")
-        return texte
-
-    def executer_tour_autonome(
-        self,
-        message: str,
-        modele_initial: str,
-        session_id: str,
-        interruption_event=None,
-        images_tour: list[bytes] | None = None,
-    ) -> tuple[str, str, list[str], str | None]:
-        modele_courant = modele_initial
-        prompt_courant = message
-        outils_utilises_tour: list[str] = []
-        modele_delegue_final: str | None = None
-        historique = charger_memoire_rapide(session_id=session_id, limite_echanges=6)
-
-        for nb_transferts in range(MAX_TRANSFERTS_TOUR + 1):
-            if interruption_event is not None and interruption_event.is_set():
-                return "", modele_courant, outils_utilises_tour, modele_delegue_final
-
-            route_cfg = self.routeur.config["routes"].get(modele_courant, {})
-            outils_liste = self._liste_outils_route(route_cfg)
-            a_shell = route_cfg.get("shell_tools", False) and self.routeur.config.get("shell_mode", "ask") != "off"
-            supporte_tools_natifs = True
-            est_modele_vlm = route_cfg.get("role") == "vision_multimodale"
-
-            options = {
-                "num_ctx": route_cfg.get("num_ctx", 4096),
-                "temperature": route_cfg.get("temperature", 0.25),
-            }
-            if route_cfg.get("num_predict") is not None:
-                options["num_predict"] = route_cfg["num_predict"]
-
-            msg_utilisateur: dict = {"role": "user", "content": prompt_courant}
-            if images_tour and nb_transferts == 0:
-                msg_utilisateur["images"] = [base64.b64encode(img).decode("ascii") for img in images_tour]
-
-            messages = [
-                self.construire_system_prompt(modele_courant, route_cfg, False),
-                *historique,
-                msg_utilisateur,
-            ]
-
-            appels_compteur: dict[str, int] = {}
-            derniere_signature_appel: str | None = None
-            raison_interruption: str | None = None
-            rattrapage_simulation_fait = False
-            demande_transfert: tuple[str, str, str] | None = None
-
-            for _ in range(MAX_ETAPES_AGENT):
-                if interruption_event is not None and interruption_event.is_set():
-                    return "", modele_courant, outils_utilises_tour, modele_delegue_final
-
-                self._compresser_historique_outils(messages)
-                texte_tour = ""
-                tool_calls_recus = []
-                mode_fallback_texte = False
-
-                for tentative in (1, 2):
-                    if tentative == 1 and supporte_tools_natifs and outils_liste:
-                        outils_actifs = outils_liste
-                        mode_fallback_texte = False
-                        messages[0] = self.construire_system_prompt(modele_courant, route_cfg, False)
-                    else:
-                        outils_actifs = None
-                        mode_fallback_texte = True
-                        messages[0] = self.construire_system_prompt(modele_courant, route_cfg, True)
-
-                    try:
-                        stream = self._appel_stream_ollama(
-                            modele_courant,
-                            messages,
-                            outils_actifs,
-                            options,
-                            interruption_event=interruption_event,
-                            keep_alive=0 if est_modele_vlm else "4m",
-                        )
-                        texte_tour = ""
-                        tool_calls_recus = []
-                        for chunk in stream:
-                            msg_chunk = chunk.get("message", {})
-                            if msg_chunk.get("content"):
-                                morceau = msg_chunk["content"]
-                                if not mode_fallback_texte:
-                                    panels.ecrire_chat(morceau, fin="")
-                                texte_tour += morceau
-                            if msg_chunk.get("tool_calls"):
-                                tool_calls_recus.extend(msg_chunk["tool_calls"])
-                        break
-                    except ollama.ResponseError as err:
-                        if tentative == 1 and "does not support tools" in str(err):
-                            supporte_tools_natifs = False
-                            continue
-                        raise
-
-                if interruption_event is not None and interruption_event.is_set():
-                    panels.flush_chat()
-                    return texte_tour, modele_courant, outils_utilises_tour, modele_delegue_final
-
-                if mode_fallback_texte:
-                    match_transfert = REGEX_BALISE_TRANSFERT_FALLBACK.search(texte_tour)
-                    if match_transfert:
-                        cible_raw = match_transfert.group(1).strip().lstrip("@")
-                        consigne = match_transfert.group(2).strip()
-                        demande_transfert = (cible_raw, "Délégation demandée par le modèle", consigne)
-                        break
-
-                    match_web = REGEX_BALISE_WEB_FALLBACK.search(texte_tour)
-                    if match_web:
-                        requete_web = match_web.group(1).strip()
-                        if self.demander_autorisation_web(modele_courant, "rechercher sur Internet", requete_web):
-                            res = rechercher_sur_internet(requete_web)
-                            panels.log_outil(f"Résultat web :\n{res[:1200]}")
-                            outils_utilises_tour.append("rechercher_sur_internet")
-                            messages.append({"role": "assistant", "content": texte_tour})
-                            messages.append({
-                                "role": "user",
-                                "content": f"[RÉSULTATS INTERNET POUR '{requete_web}'] :\n{res}\n\nRéponds brièvement en te basant sur ces résultats.",
-                            })
-                        else:
-                            messages.append({"role": "assistant", "content": texte_tour})
-                            messages.append({"role": "user", "content": "[ACCÈS INTERNET REFUSÉ] Dis-le brièvement."})
-                        continue
-
-                    panels.ecrire_chat(texte_tour)
-                    return texte_tour, modele_courant, outils_utilises_tour, modele_delegue_final
-
-                if not tool_calls_recus:
-                    texte_min = texte_tour.lower()
-                    tente_simulation = a_shell and not rattrapage_simulation_fait and (
-                        "[simulé]" in texte_min
-                        or "simuler l'exécution" in texte_min
-                        or "je ne peux pas exécuter directement" in texte_min
-                    )
-                    if tente_simulation:
-                        rattrapage_simulation_fait = True
-                        panels.ecrire_chat("\n  [Rattrapage Agent -> simulation bloquée, exécution réelle forcée...]\n")
-                        messages.append({"role": "assistant", "content": texte_tour})
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "[ERREUR SYSTÈME : Tu as l'outil `executer_commande_shell` actif. "
-                                "N'écris JAMAIS `[simulé]`. Appelle MAINTENANT `executer_commande_shell` avec la commande.]"
-                            ),
-                        })
-                        continue
-
-                    panels.flush_chat()
-                    panels.ecrire_chat("")
-                    return texte_tour, modele_courant, outils_utilises_tour, modele_delegue_final
-
-                panels.flush_chat()
-                messages.append({"role": "assistant", "content": texte_tour, "tool_calls": tool_calls_recus})
-                for appel in tool_calls_recus:
-                    if interruption_event is not None and interruption_event.is_set():
-                        return texte_tour, modele_courant, outils_utilises_tour, modele_delegue_final
-
-                    nom_fn = appel["function"]["name"]
-                    args = appel["function"].get("arguments", {})
-
-                    if nom_fn == "transferer_tache":
-                        cible_raw = str(args.get("modele_cible", "")).strip().lstrip("@")
-                        raison_tr = str(args.get("raison", "Expertise mieux adaptée")).strip()
-                        consigne_tr = str(args.get("consigne_transmise", message)).strip()
-                        demande_transfert = (cible_raw, raison_tr, consigne_tr)
-                        break
-
-                    signature_appel = f"{nom_fn}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
-                    appels_compteur[signature_appel] = appels_compteur.get(signature_appel, 0) + 1
-                    if signature_appel == derniere_signature_appel or appels_compteur[signature_appel] >= 3:
-                        raison_interruption = f"Boucle infinie stoppée sur `{nom_fn}`"
-                        break
-                    derniere_signature_appel = signature_appel
-
-                    if nom_fn in NOMS_OUTILS_WEB:
-                        cible = args.get("requete") or args.get("url") or str(args)
-                        action = "rechercher sur Internet" if nom_fn == "rechercher_sur_internet" else "lire la page web"
-                        if not self.demander_autorisation_web(modele_courant, action, cible):
-                            messages.append({"role": "tool", "content": "REFUS UTILISATEUR : Accès Internet refusé."})
-                            continue
-
-                    panels.log_outil(f"Appel outil : {nom_fn}({args})")
-                    fn = MAP_TOUS_OUTILS.get(nom_fn)
-                    if fn:
-                        outils_utilises_tour.append(nom_fn)
-                        try:
-                            resultat_outil = str(fn(**args))
-                        except TypeError as err_args:
-                            resultat_outil = f"Erreur d'arguments pour `{nom_fn}` : {err_args}. Corrige les paramètres et réessaie."
-                    else:
-                        resultat_outil = f"Outil inconnu : {nom_fn}"
-
-                    panels.log_outil(f"Retour {nom_fn} :\n{resultat_outil[:1500]}")
-
-                    if appels_compteur[signature_appel] == 2:
-                        resultat_outil += "\n[AVERTISSEMENT : Appel déjà effectué. Change d'approche ou délègue via `transferer_tache`.]"
-
-                    messages.append({"role": "tool", "content": resultat_outil})
-
-                if demande_transfert or raison_interruption:
-                    break
-
-            if demande_transfert:
-                cible_raw, raison_tr, consigne_tr = demande_transfert
-                nouveau_modele = self.routeur.resoudre_modele(cible_raw)
-                role_phatique = self.routeur.modele_par_role("phatique")
-
-                if nouveau_modele and nouveau_modele != modele_courant and nouveau_modele != role_phatique and nb_transferts < MAX_TRANSFERTS_TOUR:
-                    panels.ecrire_chat(f"\n  [Transfert autonome] {modele_courant} -> {nouveau_modele} ({raison_tr})\n")
-                    modele_delegue_final = nouveau_modele
-                    prompt_courant = (
-                        f"[TÂCHE DÉLÉGUÉE PAR {modele_courant}]\n"
-                        f"Pourquoi il t'a passé la main : {raison_tr}\n"
-                        f"Demande initiale de l'utilisateur : {message}\n"
-                        f"Action précise à accomplir : {consigne_tr}"
-                    )
-                    modele_courant = nouveau_modele
-                    continue
-
-            motif_arret = raison_interruption or f"Plafond de {MAX_ETAPES_AGENT} étapes atteint"
-            bilan = self._generer_bilan_arret(
-                modele_courant,
-                messages,
-                options,
-                motif_arret,
-                interruption_event=interruption_event,
-            )
-            return bilan, modele_courant, outils_utilises_tour, modele_delegue_final
-
-        return "Transferts maximum atteints.", modele_courant, outils_utilises_tour, modele_delegue_final
-
-
-def afficher_aide() -> None:
-    panels.ecrire_chat("""
-Commandes disponibles :
-  @<alias> <prompt>              Force un modèle précis (ex: @code lis main.py, @12b analyse...)
-  /model <alias | auto>          Verrouille un modèle pour la session, ou repasse en 'auto'
-  /models                        Affiche l'équipe de modèles, leurs alias et leurs permissions
-  /set <alias> <param> <val>     Modifie temperature, num_ctx, num_predict, web_tools, file_tools, shell_tools, defaut, optimiseur
-  /add-example <alias> <phrase>  Ajoute une phrase d'entraînement au routeur et recharge le cache
-  /web <ask | auto | off>        Accès Internet ('ask' = permission, 'auto' = libre, 'off' = coupé)
-  /files <ask | auto | ro>       Accès Fichiers ('ask' = écriture sur confirmation, 'auto' = libre, 'ro' = lecture seule)
-  /shell <ask | auto | off>      Accès Terminal ('ask' = permission, 'auto' = libre autonome, 'off' = coupé)
-  /enroll [nom]                  Enregistre le visage actuel (ex: /enroll Bryan, /enroll Pere)
-  /enroll reset [nom]            Réinitialise un profil ou toute la biométrie
-  /security <auto | absent | off> Mode sécurité caméra ('absent' = alerte immédiate si inconnu)
-  /history [n]                   Affiche les n derniers échanges enregistrés
-  /clear [session | all]         Vide l'historique du jour, de la session ou total
-  /memory                        Affiche la mémoire utile permanente
-  /forget <clé>                  Supprime une entrée de la mémoire utile
-  /optimize                      Lance l'optimiseur (audit + entraînement routeur + consolidation mémoire)
-  /help                          Affiche cette aide
-  [Touche Échap ou voix]         Interrompt Eon instantanément pendant qu'il répond
-""")
-
-
-def traiter_commande(cmd: str, app: OrchestrateurAgent, session_id: str) -> tuple[bool, str]:
-    parties = cmd.split()
-    action = parties[0].lower()
-    cfg = app.routeur.config
-
-    if action == "/help":
-        afficher_aide()
-        return True, session_id
-
-    if action == "/enroll":
-        if app.perception is None:
-            panels.ecrire_chat("[Erreur] Module de perception inactif.\n")
-            return True, session_id
-        if len(parties) >= 2 and parties[1].lower() == "reset":
-            cible = parties[2] if len(parties) >= 3 else None
-            panels.ecrire_chat(f"[Eon Biométrie] {app.perception.reinitialiser_profil_biometrique(cible)}\n")
-        else:
-            nom = parties[1] if len(parties) >= 2 else "Bryan"
-            panels.ecrire_chat(f"[Eon Biométrie] {app.perception.enregistrer_visage_autorise(nom)}\n")
-        return True, session_id
-
-    if action == "/security":
-        if app.perception is None:
-            return True, session_id
-        if len(parties) < 2 or parties[1].lower() not in ("auto", "absent", "off"):
-            panels.ecrire_chat(f"Mode sécurité actuel : {app.perception.mode_securite} | Usage : /security <auto|absent|off>\n")
-            return True, session_id
-        app.perception.mode_securite = parties[1].lower()
-        cfg.setdefault("eon", {})["mode_securite"] = app.perception.mode_securite
-        app.routeur.sauvegarder_config()
-        panels.ecrire_chat(f"[Eon Sécurité] mode_securite = {app.perception.mode_securite}\n")
-        return True, session_id
-
-    if action == "/history":
-        nb = int(parties[1]) if len(parties) > 1 and parties[1].isdigit() else 10
-        panels.ecrire_chat("\n" + consulter_historique(limite=nb) + "\n")
-        return True, session_id
-
-    if action == "/models":
-        emb = cfg.get("routage", {}).get("utiliser_embeddings", True)
-        panels.ecrire_chat(
-            f"\nWeb : {cfg.get('web_mode', 'ask')} | Fichiers : {cfg.get('file_mode', 'ask')} | "
-            f"Terminal : {cfg.get('shell_mode', 'ask')} | Embeddings : {emb} | Optimiseur : {cfg.get('modele_optimiseur')}"
-        )
-        panels.ecrire_chat(f"Modèle verrouillé : {app.modele_verrouille or 'Aucun (auto + délégation)'}\n")
-        for nom, r in cfg["routes"].items():
-            panels.ecrire_chat(
-                f"  - [{r.get('alias', '?'):5}] {nom:32} | rôle={r['role']:18} | "
-                f"web={r.get('web_tools', False)} | files={r.get('file_tools', False)} | shell={r.get('shell_tools', False)}"
-            )
-        panels.ecrire_chat("")
-        return True, session_id
-
-    if action == "/model":
-        if len(parties) < 2:
-            panels.ecrire_chat("Usage : /model <alias_ou_nom> ou /model auto\n")
-            return True, session_id
-        if parties[1].lower() == "auto":
-            app.modele_verrouille = None
-            panels.ecrire_chat("[Système] Routage automatique réactivé.\n")
-        else:
-            modele = app.routeur.resoudre_modele(parties[1])
-            if not modele:
-                panels.ecrire_chat(f"[Erreur] Modèle inconnu : {parties[1]}\n")
-            else:
-                app.modele_verrouille = modele
-                panels.ecrire_chat(f"[Système] Session verrouillée sur : {modele}\n")
-        return True, session_id
-
-    if action == "/set":
-        if len(parties) < 4:
-            panels.ecrire_chat("Usage : /set <alias> <temperature|num_ctx|num_predict|web_tools|file_tools|shell_tools|defaut|optimiseur> <valeur>\n")
-            return True, session_id
-        modele = app.routeur.resoudre_modele(parties[1])
-        if not modele:
-            panels.ecrire_chat(f"[Erreur] Modèle inconnu : {parties[1]}\n")
-            return True, session_id
-        param = parties[2].lower()
-        val_str = parties[3]
-
-        try:
-            if param == "temperature":
-                cfg["routes"][modele]["temperature"] = float(val_str)
-            elif param == "num_ctx":
-                cfg["routes"][modele]["num_ctx"] = int(val_str)
-            elif param == "num_predict":
-                cfg["routes"][modele]["num_predict"] = None if val_str.lower() == "none" else int(val_str)
-            elif param in ("web_tools", "file_tools", "shell_tools"):
-                cfg["routes"][modele][param] = val_str.lower() in ("true", "1", "oui", "on")
-            elif param == "defaut":
-                cfg["route_defaut"] = modele
-            elif param == "optimiseur":
-                cfg["modele_optimiseur"] = modele
-            else:
-                panels.ecrire_chat(f"[Erreur] Paramètre inconnu : {param}\n")
-                return True, session_id
-
-            app.routeur.sauvegarder_config()
-            panels.ecrire_chat(f"[Système] {modele} -> {param} = {val_str} (sauvegardé)\n")
-        except ValueError:
-            panels.ecrire_chat(f"[Erreur] Valeur invalide pour {param} : {val_str}\n")
-        return True, session_id
-
-    if action == "/add-example":
-        if len(parties) < 3:
-            panels.ecrire_chat("Usage : /add-example <alias> <phrase d'exemple>\n")
-            return True, session_id
-        modele = app.routeur.resoudre_modele(parties[1])
-        if not modele:
-            panels.ecrire_chat(f"[Erreur] Modèle inconnu : {parties[1]}\n")
-            return True, session_id
-        phrase = " ".join(parties[2:]).strip().lower()
-        cfg["routes"][modele].setdefault("examples", []).append(phrase)
-        app.routeur.sauvegarder_config()
-        app.routeur.charger()
-        panels.ecrire_chat(f"[Système] Exemple ajouté à {modele} et vecteurs mis à jour.\n")
-        return True, session_id
-
-    if action in ("/web", "/files", "/shell"):
-        cles = {"/web": ("web_mode", ("ask", "auto", "off")), "/files": ("file_mode", ("ask", "auto", "ro")), "/shell": ("shell_mode", ("ask", "auto", "off"))}
-        cle_cfg, valides = cles[action]
-        if len(parties) < 2 or parties[1].lower() not in valides:
-            panels.ecrire_chat(f"Usage : {action} <{'|'.join(valides)}>\n")
-            return True, session_id
-        cfg[cle_cfg] = parties[1].lower()
-        app._synchroniser_modes_outils()
-        app.routeur.sauvegarder_config()
-        panels.ecrire_chat(f"[Système] {cle_cfg} = {cfg[cle_cfg]}\n")
-        return True, session_id
-
-    if action == "/clear":
-        sous_cmd = parties[1].lower() if len(parties) > 1 else "jour"
-        nouvelle_session = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-        if sous_cmd == "session":
-            panels.ecrire_chat("[Système] Contexte de la session actuelle réinitialisé.\n")
-            return True, nouvelle_session
-        if sous_cmd == "all":
-            confirm = panels.saisir("Confirmer la suppression de TOUT l'historique ? [o/N] : ").strip().lower()
-            if confirm in ("o", "oui"):
-                effacer_tout_historique()
-                panels.ecrire_chat("[Système] Historique entièrement effacé.\n")
-            return True, nouvelle_session
-        nb = effacer_historique_jour()
-        panels.ecrire_chat(f"[Système] {nb} échange(s) d'aujourd'hui supprimé(s) et session réinitialisée.\n")
-        return True, nouvelle_session
-
-    if action == "/memory":
-        panels.ecrire_chat("\n" + json.dumps(charger_memoire_utile(), indent=2, ensure_ascii=False) + "\n")
-        return True, session_id
-
-    if action == "/forget":
-        if len(parties) < 2:
-            panels.ecrire_chat("Usage : /forget <cle>\n")
-            return True, session_id
-        if supprimer_fait_utilisateur(parties[1]):
-            panels.ecrire_chat(f"[Système] Clé '{parties[1]}' supprimée.\n")
-        else:
-            panels.ecrire_chat(f"[Système] Clé '{parties[1]}' introuvable.\n")
-        return True, session_id
-
-    if action == "/optimize":
-        bilan = executer_optimisation_nocturne()
-        panels.ecrire_chat(f"\n[Système] {bilan}\n")
-        app.verifier_hot_reload()
-        return True, session_id
-
-    panels.ecrire_chat(f"[Système] Commande inconnue : {action} (tape /help)\n")
-    return True, session_id
-
-
-def _extraire_image_camera_bytes(perception: PerceptionEon) -> list[bytes] | None:
-    """Capture l'image brute de la webcam pour un envoi direct en 1 passe au VLM."""
-    try:
-        import cv2
-    except ImportError:
-        return None
-    if not perception.camera_active:
-        return None
+def _extraire_image_camera_bytes(perception: PerceptionEon) -> list[bytes]:
+    """Extrait instantanément la dernière frame webcam en JPEG pour un appel VLM direct en 1 passe."""
+    if cv2 is None or not perception.camera_active:
+        return []
     with perception._lock_vision:
         frame = perception._derniere_frame.copy() if perception._derniere_frame is not None else None
     if frame is None:
-        return None
+        return []
     ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-    return [bytes(buf)] if ok else None
+    return [bytes(buf)] if ok else []
 
 
-def boucle_principale() -> None:
-    global _PERCEPTION_ACTIVE
+def _collecter_fonctions_module(mod: Any, noms_autorises: set[str] | None = None) -> dict[str, Callable]:
+    """Récupère les fonctions publiques d'un module d'outils."""
+    if mod is None:
+        return {}
+    if hasattr(mod, "OUTILS") and isinstance(mod.OUTILS, dict):
+        return {
+            k: v
+            for k, v in mod.OUTILS.items()
+            if callable(v) and (noms_autorises is None or k in noms_autorises)
+        }
+    fonctions: dict[str, Callable] = {}
+    for nom, obj in inspect.getmembers(mod, inspect.isfunction):
+        if nom.startswith("_"):
+            continue
+        if obj.__module__ != mod.__name__:
+            continue
+        if noms_autorises is None or nom in noms_autorises:
+            fonctions[nom] = obj
+    return fonctions
 
-    app = OrchestrateurAgent()
-    session_courante = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
-    dernier_modele: str | None = None
-    dernier_prompt_valide: str | None = None
-    derniere_reponse_valide: str | None = None
-    attente_confirmation_web_texte = False
-    attente_arret_tache_bloquee = False
-    modele_phatique = app.routeur.modele_par_role("phatique")
 
-    def _on_alerte(msg_alerte: str) -> None:
-        panels.ecrire_chat(f"\n🚨 {msg_alerte}\n")
+class ApplicationEon:
+    """Orchestrateur principal d'Eon (Routage sémantique, mémoire 3 niveaux, capteurs et outils)."""
 
-    perception = PerceptionEon(app.routeur.config.get("eon", {}), on_alerte_securite=_on_alerte)
-    app.perception = perception
-    _PERCEPTION_ACTIVE = perception
+    def __init__(self) -> None:
+        self.session_id = uuid.uuid4().hex[:12]
+        self.routeur = RouteurAutonome()
+        self.perception = PerceptionEon(
+            config_eon=self.routeur.config.get("perception", {}),
+            on_alerte_securite=self._gerer_alerte_securite,
+        )
+        embed_model = self.routeur.config.get("routage", {}).get("embed_model", "bge-m3")
+        self.compresseur = (
+            GestionnaireContexteMultiNiveaux(modele_compresseur="qwen3:0.6b", embed_model=embed_model)
+            if GestionnaireContexteMultiNiveaux is not None
+            else None
+        )
 
-    panels.enregistrer_callbacks_ui(
-        on_prompt=perception.soumettre_texte_clavier,
-        on_escape=perception.declencher_interruption,
-    )
+        self.modele_verrouille: str | None = None
+        self.dernier_modele: str | None = None
+        self.modele_gpu_charge: str | None = None
+        self.dernier_prompt_valide: str = ""
+        self.derniere_reponse_valide: str = ""
+        self.journal_outils_session: list[str] = []
 
-    panels.ecrire_chat("Eon est prêt (3 panneaux actifs : Conversation / Outils / Perception). Tape /help.\n")
-    perception.demarrer()
+        self.catalogue_web = _collecter_fonctions_module(web_tools)
+        self.catalogue_files = _collecter_fonctions_module(file_tools)
+        self.catalogue_shell = _collecter_fonctions_module(shell_tools)
+        self.catalogue_base: dict[str, Callable] = {
+            "observer_camera": self.perception.observer_camera,
+            "capturer_photo": self.perception.capturer_photo,
+            "consulter_historique": consulter_historique,
+            "rechercher_dans_historique": rechercher_dans_historique,
+            "exporter_historique": exporter_historique,
+            "memoriser_fait_utilisateur": memoriser_fait_utilisateur,
+        }
 
-    try:
-        while True:
-            entrant = perception.attendre_message()
+    def _gerer_alerte_securite(self, message_alerte: str) -> None:
+        _log_outil(message_alerte)
+        panels.ecrire_chat(f"\n⚠️ {message_alerte}")
+
+    def _obtenir_modele_vlm(self) -> str | None:
+        for nom, cfg in self.routeur.config.get("routes", {}).items():
+            if cfg.get("role") == "vision_multimodale":
+                return nom
+        return "gemma3:12b-it-qat"
+
+    def _liberer_vram_si_changement_lourd(self, nouveau_modele: str) -> None:
+        """Décharge l'ancien modèle lourd de la RTX 5050 (8 Go) avant d'en charger un autre."""
+        ancien = self.modele_gpu_charge
+        if (
+            ancien
+            and ancien != nouveau_modele
+            and ancien.lower() in MODELES_LOURDS_GPU
+            and nouveau_modele.lower() in MODELES_LOURDS_GPU
+        ):
+            try:
+                _log_outil(f"[VRAM] Déchargement de {ancien} avant chargement de {nouveau_modele}...")
+                ollama.generate(model=ancien, prompt="", keep_alive=0)
+            except Exception:
+                pass
+        if nouveau_modele.lower() in MODELES_LOURDS_GPU:
+            self.modele_gpu_charge = nouveau_modele
+
+    def _assembler_outils_tour(self, route_cfg: dict, forcer_web: bool = False) -> dict[str, Callable]:
+        outils = dict(self.catalogue_base)
+        web_mode = self.routeur.config.get("web_mode", "auto")
+        file_mode = self.routeur.config.get("file_mode", "ask")
+        shell_mode = self.routeur.config.get("shell_mode", "auto")
+
+        if web_mode != "off" and (route_cfg.get("web_tools", False) or forcer_web):
+            outils.update(self.catalogue_web)
+        if file_mode != "off" and route_cfg.get("file_tools", False):
+            outils.update(self.catalogue_files)
+        if shell_mode != "off" and route_cfg.get("shell_tools", False):
+            outils.update(self.catalogue_shell)
+        return outils
+
+    def _construire_system_prompt(self, modele: str, route_cfg: dict) -> str:
+        maintenant = datetime.datetime.now()
+        date_fr = maintenant.strftime("%A %d/%m/%Y %H:%M")
+        etat_capteurs = self.perception.decrire_etat_capteurs()
+        regles = self.routeur.config.get("regles_apprises", [])
+        bloc_regles = "\n".join(f"- {r}" for r in regles) if regles else "- Sois précis, direct et factuel."
+
+        memoire_utilisateur = ""
+        try:
+            mem = formater_contexte_memoire()
+            if mem.strip():
+                memoire_utilisateur = f"\n{mem.strip()}\n"
+        except Exception:
+            pass
+
+        return (
+            f"Tu es Eon, l'assistant IA personnel et local de Bryan (machine Linux Fedora, Reims, France).\n"
+            f"Date et heure actuelles : {date_fr}.\n"
+            f"Modèle actif : {modele} (rôle : {route_cfg.get('role', 'general')}).\n"
+            f"État des capteurs temps réel : {etat_capteurs}\n"
+            f"{memoire_utilisateur}\n"
+            "RÈGLES IMPÉRATIVES :\n"
+            "1. PRIORITÉ ABSOLUE AUX RÉSULTATS WEB : Si un outil de recherche internet (`rechercher_sur_internet` ou `lire_page_web`) "
+            "retourne un fait daté qui contredit tes connaissances internes ou tes réponses précédentes dans la conversation, "
+            "le résultat de l'outil a TOUJOURS raison. Ne répète jamais une ancienne erreur.\n"
+            "2. HONNÊTETÉ DES OUTILS : Ne simule jamais l'exécution d'une commande, le contenu d'un fichier ou un historique de conversation. "
+            "Utilise toujours les vrais outils (`exporter_historique`, `lire_fichier`, `ecrire_fichier`, `executer_commande_shell`, `observer_camera`).\n"
+            "3. CONCISION ET TON : Réponds en français naturel, direct et efficace, sans blabla inutile.\n"
+            f"{bloc_regles}"
+        )
+
+    def _demander_confirmation_outil(self, nom_outil: str, args: dict) -> bool:
+        """Demande l'accord de l'utilisateur pour un outil sensible via le routeur sémantique."""
+        resume_args = json.dumps(args, ensure_ascii=False)[:180]
+        panels.ecrire_chat(f"\n[AUTORISATION REQUISE] Exécuter `{nom_outil}({resume_args})` ? (oui/non)")
+        self.perception.autoriser_saisie()
+        reponse = self.perception.attendre_message()
+        if reponse is None:
+            return False
+        accord, raison = self.routeur.interpreter_consentement(reponse.texte)
+        _log_outil(f"[CONSENTEMENT] {nom_outil} -> {'AUTORISÉ' if accord else 'REFUSÉ'} ({raison})")
+        return accord
+
+    def _executer_outil(self, nom_outil: str, args: dict, outils_disponibles: dict[str, Callable]) -> str:
+        fn = outils_disponibles.get(nom_outil)
+        if fn is None:
+            return f"Erreur : outil `{nom_outil}` non autorisé ou indisponible pour ce modèle."
+
+        file_mode = self.routeur.config.get("file_mode", "ask")
+        shell_mode = self.routeur.config.get("shell_mode", "auto")
+
+        if nom_outil in OUTILS_SENSIBLES_FICHIERS and file_mode == "ask":
+            if not self._demander_confirmation_outil(nom_outil, args):
+                return "Action annulée par l'utilisateur."
+        elif nom_outil in OUTILS_SENSIBLES_SHELL and shell_mode == "ask":
+            if not self._demander_confirmation_outil(nom_outil, args):
+                return "Commande shell annulée par l'utilisateur."
+
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        entree_trace = f"[{ts}] Appel outil : {nom_outil}({args})"
+        self.journal_outils_session.append(entree_trace)
+        _log_outil(entree_trace)
+
+        try:
+            sig = inspect.signature(fn)
+            accepte_kwargs = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if accepte_kwargs:
+                args_filtres = args
+            else:
+                args_filtres = {k: v for k, v in args.items() if k in sig.parameters}
+
+            resultat = fn(**args_filtres)
+            texte_res = str(resultat)
+        except Exception as err:
+            texte_res = f"Erreur lors de l'exécution de `{nom_outil}` : {type(err).__name__} - {err}"
+
+        retour_trace = f"[{ts}] Retour {nom_outil} : {texte_res[:350]}"
+        self.journal_outils_session.append(retour_trace)
+        _log_outil(retour_trace)
+        return texte_res
+
+    def executer_tour_autonome(
+        self,
+        modele: str,
+        route_cfg: dict,
+        prompt_utilisateur: str,
+        historique: list[dict[str, Any]],
+        images: list[bytes] | None = None,
+        forcer_web: bool = False,
+    ) -> str:
+        """Exécute la boucle autonome d'appel d'outils et de streaming interruptible."""
+        self._liberer_vram_si_changement_lourd(modele)
+        outils_dispo = self._assembler_outils_tour(route_cfg, forcer_web=forcer_web)
+        liste_callables = list(outils_dispo.values()) if not images else []
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self._construire_system_prompt(modele, route_cfg)}
+        ]
+        messages.extend(historique)
+
+        msg_user: dict[str, Any] = {"role": "user", "content": prompt_utilisateur}
+        if images:
+            msg_user["images"] = images
+        messages.append(msg_user)
+
+        options_ollama = {
+            "temperature": float(route_cfg.get("temperature") if route_cfg.get("temperature") is not None else 0.2),
+            "num_ctx": int(route_cfg.get("num_ctx") or 4096),
+            "num_predict": int(route_cfg.get("num_predict") or 768),
+        }
+
+        keep_alive = "30s" if ("12b" in modele.lower() or "14b" in modele.lower()) else "5m"
+
+        self.perception.interruption_event.clear()
+        self.perception.ia_en_cours.set()
+
+        reponse_finale_chunks: list[str] = []
+        appels_deja_faits: set[str] = set()
+        max_etapes = 6
+
+        try:
+            for _etape in range(max_etapes):
+                if self.perception.interruption_event.is_set():
+                    reponse_finale_chunks.append("\n[Interrompu]")
+                    break
+
+                kwargs_chat: dict[str, Any] = {
+                    "model": modele,
+                    "messages": messages,
+                    "options": options_ollama,
+                    "keep_alive": keep_alive,
+                    "stream": True,
+                }
+                if liste_callables:
+                    kwargs_chat["tools"] = liste_callables
+
+                try:
+                    if "qwen3" in modele.lower():
+                        flux = ollama.chat(**kwargs_chat, think=False)
+                    else:
+                        flux = ollama.chat(**kwargs_chat)
+                except TypeError:
+                    flux = ollama.chat(**kwargs_chat)
+
+                texte_etape = ""
+                tool_calls_etape: list[Any] = []
+                dans_balise_think = False
+
+                for chunk in flux:
+                    if self.perception.interruption_event.is_set():
+                        break
+
+                    msg_chunk = chunk.get("message") if isinstance(chunk, dict) else getattr(chunk, "message", None)
+                    if msg_chunk is None:
+                        continue
+
+                    t_calls = (
+                        msg_chunk.get("tool_calls")
+                        if isinstance(msg_chunk, dict)
+                        else getattr(msg_chunk, "tool_calls", None)
+                    )
+                    if t_calls:
+                        tool_calls_etape.extend(t_calls)
+
+                    contenu = (
+                        msg_chunk.get("content", "")
+                        if isinstance(msg_chunk, dict)
+                        else getattr(msg_chunk, "content", "")
+                    )
+                    if contenu:
+                        if "<think>" in contenu:
+                            dans_balise_think = True
+                            contenu = contenu.split("<think>", 1)[0]
+                        if "</think>" in contenu:
+                            dans_balise_think = False
+                            contenu = contenu.split("</think>", 1)[1]
+                        if dans_balise_think or not contenu:
+                            continue
+
+                        if not texte_etape and not reponse_finale_chunks:
+                            panels.ecrire_chat(f"\nEon ({modele}) : ", fin="")
+                        panels.ecrire_chat(contenu, fin="")
+                        texte_etape += contenu
+                        reponse_finale_chunks.append(contenu)
+
+                if self.perception.interruption_event.is_set():
+                    panels.ecrire_chat("\n[Génération interrompue]")
+                    break
+
+                if not tool_calls_etape:
+                    break
+
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": texte_etape,
+                        "tool_calls": tool_calls_etape,
+                    }
+                )
+
+                for tc in tool_calls_etape:
+                    if self.perception.interruption_event.is_set():
+                        break
+                    fn_info = tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)
+                    nom_fn = fn_info.get("name") if isinstance(fn_info, dict) else getattr(fn_info, "name", "")
+                    raw_args = fn_info.get("arguments", {}) if isinstance(fn_info, dict) else getattr(fn_info, "arguments", {})
+
+                    if isinstance(raw_args, str):
+                        try:
+                            args_dict = json.loads(raw_args)
+                        except json.JSONDecodeError:
+                            args_dict = {}
+                    else:
+                        args_dict = dict(raw_args or {})
+
+                    signature_appel = f"{nom_fn}:{json.dumps(args_dict, sort_keys=True)}"
+                    if signature_appel in appels_deja_faits:
+                        res_outil = (
+                            "Tu as déjà exécuté exactement cet appel d'outil avec ces mêmes paramètres. "
+                            "Utilise directement les résultats obtenus précédemment pour répondre."
+                        )
+                    else:
+                        appels_deja_faits.add(signature_appel)
+                        res_outil = self._executer_outil(nom_fn, args_dict, outils_dispo)
+
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "content": res_outil,
+                        }
+                    )
+
+            panels.ecrire_chat("")
+            panels.flush_chat()
+        except Exception as err:
+            err_msg = f"\n[Erreur modèle {modele}] {type(err).__name__} : {err}"
+            panels.ecrire_chat(err_msg)
+            panels.flush_chat()
+            reponse_finale_chunks.append(err_msg)
+        finally:
+            self.perception.ia_en_cours.clear()
+            self.perception.interruption_event.clear()
+
+        return "".join(reponse_finale_chunks).strip()
+
+    # ---------------- COMMANDES SLASH ----------------
+
+    def traiter_commande_slash(self, cmd_brute: str) -> bool:
+        """Traite les commandes `/...`. Retourne False si l'utilisateur demande à quitter."""
+        morceaux = cmd_brute.strip().split(maxsplit=1)
+        cmd = morceaux[0].lower()
+        arg = morceaux[1].strip() if len(morceaux) > 1 else ""
+
+        if cmd in ("/quit", "/exit"):
+            self.perception.arret_global.set()
+            return False
+
+        if cmd == "/help":
+            panels.ecrire_chat(
+                "\nCommandes disponibles :\n"
+                "  @<alias> <prompt>      : Forcer un modèle sur un seul message (ex: @code+, @12b, @c)\n"
+                "  /model <alias|auto>    : Verrouiller un modèle ou revenir au routage automatique\n"
+                "  /models                : Lister les modèles, alias et rôles configurés\n"
+                "  /history [N]           : Afficher les N derniers échanges et les logs d'outils\n"
+                "  /export [chemin]       : Exporter l'historique réel dans un fichier texte\n"
+                "  /enroll [nom|reset]    : Enregistrer un visage autorisé ou réinitialiser la biométrie\n"
+                "  /secu [auto|absent|off]: Régler le mode de surveillance caméra\n"
+                "  /capteurs              : Afficher l'état temps réel de la caméra et du micro\n"
+                "  /web|file|shell <mode> : Changer les permissions d'outils (auto | ask | off)\n"
+                "  /forget                : Purger le contexte actif en RAM\n"
+                "  /reload                : Recharger config_ia.json et entrainement_routage.json\n"
+                "  /optimize [min]        : Lancer l'optimisation fine en arrière-plan (défaut 55 min)\n"
+                "  /quit                  : Quitter Eon"
+            )
+            return True
+
+        if cmd == "/optimize":
+            if optimizer is None:
+                panels.ecrire_chat("\nModule optimizer.py introuvable.")
+                return True
+            duree = int(arg) if arg.isdigit() else 55
+            panels.ecrire_chat(
+                f"\nLancement de l'optimisation fine en arrière-plan (budget max {duree} min, contrôle thermique actif)..."
+            )
+
+            def _run_opti() -> None:
+                rapport = optimizer.executer_optimisation_nocturne(duree_max_minutes=duree)
+                self.routeur.charger(silencieux=True)
+                panels.ecrire_chat(f"\n{rapport}")
+
+            threading.Thread(target=_run_opti, daemon=True).start()
+            return True
+
+        if cmd == "/models":
+            lignes = ["\nModèles configurés :"]
+            for nom, cfg in self.routeur.config.get("routes", {}).items():
+                marqueur = " [VERROUILLÉ]" if self.modele_verrouille == nom else ""
+                lignes.append(
+                    f"  - {nom} (@{cfg.get('alias', '?')}) -> rôle={cfg.get('role')} | "
+                    f"web={cfg.get('web_tools')} file={cfg.get('file_tools')} shell={cfg.get('shell_tools')}{marqueur}"
+                )
+            panels.ecrire_chat("\n".join(lignes))
+            return True
+
+        if cmd == "/model":
+            if not arg or arg.lower() == "auto":
+                self.modele_verrouille = None
+                panels.ecrire_chat("Routage automatique réactivé.")
+            else:
+                resolu = self.routeur.resoudre_modele(arg)
+                if resolu:
+                    self.modele_verrouille = resolu
+                    panels.ecrire_chat(f"Modèle verrouillé sur : {resolu}")
+                else:
+                    panels.ecrire_chat(f"Modèle inconnu : {arg}. Tape `/models` pour voir la liste.")
+            return True
+
+        if cmd == "/history":
+            limite = int(arg) if arg.isdigit() else 30
+            hist = consulter_historique(inclure_episodes=True, limite=limite)
+            panels.ecrire_chat(f"\n{hist}")
+            if self.journal_outils_session:
+                panels.ecrire_chat("\n--- DERNIERS APPELS OUTILS (SESSION) ---")
+                panels.ecrire_chat("\n".join(self.journal_outils_session[-30:]))
+            return True
+
+        if cmd == "/export":
+            res = exporter_historique(chemin_destination=arg or "~/Téléchargements/conversation_eon.txt", limite=150)
+            panels.ecrire_chat(f"\n{res}")
+            return True
+
+        if cmd == "/enroll":
+            if arg.lower() == "reset":
+                panels.ecrire_chat(f"\n{self.perception.reinitialiser_profil_biometrique()}")
+            elif arg.lower().startswith("del "):
+                panels.ecrire_chat(f"\n{self.perception.reinitialiser_profil_biometrique(arg[4:])}")
+            else:
+                panels.ecrire_chat(f"\n{self.perception.enregistrer_visage_autorise(arg or 'Bryan')}")
+            return True
+
+        if cmd == "/secu":
+            if arg.lower() in ("auto", "absent", "off"):
+                self.perception.mode_securite = arg.lower()
+                panels.ecrire_chat(f"\nMode sécurité caméra : {self.perception.mode_securite}")
+            else:
+                panels.ecrire_chat(f"\nMode actuel : {self.perception.mode_securite} (options : auto | absent | off)")
+            return True
+
+        if cmd == "/capteurs":
+            panels.ecrire_chat(f"\n{self.perception.decrire_etat_capteurs()}")
+            return True
+
+        if cmd in ("/web", "/file", "/shell"):
+            cle = f"{cmd[1:]}_mode"
+            if arg.lower() in ("auto", "ask", "off"):
+                self.routeur.config[cle] = arg.lower()
+                self.routeur.sauvegarder_config()
+                panels.ecrire_chat(f"\n{cle} réglé sur : {arg.lower()}")
+            else:
+                panels.ecrire_chat(f"\nValeur actuelle {cle} : {self.routeur.config.get(cle)} (auto | ask | off)")
+            return True
+
+        if cmd in ("/forget", "/reset"):
+            if self.compresseur is not None:
+                with self.compresseur._lock:
+                    self.compresseur.resume_actif = ""
+                    self.compresseur.vecteur_actif = []
+                    self.compresseur.fenetre_ram.clear()
+            self.dernier_modele = None
+            panels.ecrire_chat("\nContexte actif en RAM purgé.")
+            return True
+
+        if cmd == "/reload":
+            self.routeur.charger(silencieux=False)
+            panels.ecrire_chat("\nConfiguration et fichier d'entraînement sémantique rechargés.")
+            return True
+
+        panels.ecrire_chat(f"\nCommande inconnue : {cmd} (tape `/help`)")
+        return True
+
+    # ---------------- BOUCLE PRINCIPALE ----------------
+
+    def boucle_principale(self) -> None:
+        self.perception.demarrer()
+        panels.ecrire_chat(
+            "Eon est prêt (Routage sémantique + Mémoire 3 niveaux VRAM/RAM/Disque). Tape `/help` pour les commandes."
+        )
+
+        while not self.perception.arret_global.is_set():
+            self.perception.autoriser_saisie()
+            entrant: MessageEntrant | None = self.perception.attendre_message()
             if entrant is None:
-                panels.ecrire_chat("\nFin de session.")
                 break
 
-            try:
-                msg = entrant.texte.strip()
-                app.verifier_hot_reload()
+            msg = entrant.texte.strip()
+            if not msg:
+                continue
 
-                if not msg:
-                    continue
+            if self.routeur.verifier_hot_reload():
+                _log_outil("[ROUTER] Rechargement à chaud de la configuration / dataset sémantique.")
 
-                if msg.startswith("/"):
-                    _, session_courante = traiter_commande(msg, app, session_courante)
-                    attente_confirmation_web_texte = False
-                    continue
+            if msg.startswith("/"):
+                if not self.traiter_commande_slash(msg):
+                    break
+                continue
 
-                tache_active = obtenir_tache_en_cours()
-                if tache_active is not None:
-                    if attente_arret_tache_bloquee:
-                        est_oui, _ = app.routeur.interpreter_consentement(msg)
-                        attente_arret_tache_bloquee = False
-                        if est_oui:
-                            panels.ecrire_chat(f"-> Eon : {arreter_tache_en_cours()}\n")
-                        else:
-                            panels.ecrire_chat(f"-> Eon : D'accord, je laisse « {tache_active.commande} » continuer en fond.\n")
-                        continue
+            modele_force: str | None = None
+            prompt_effectif = msg
+            match_at = re.match(r"^@([^\s]+)\s+(.+)$", msg, flags=re.S)
+            if match_at:
+                cand = self.routeur.resoudre_modele(match_at.group(1))
+                if cand:
+                    modele_force = cand
+                    prompt_effectif = match_at.group(2).strip()
 
-                    if tache_active.est_bloquee(seuil_sec=20.0):
-                        attente_arret_tache_bloquee = True
-                        panels.ecrire_chat(
-                            f"\n-> Eon : La tâche « {tache_active.commande} » tourne en arrière-plan sans sortie depuis "
-                            f"{tache_active.secondes_sans_activite():.0f}s. Veux-tu l'arrêter ?\n"
-                        )
-                        continue
+            # Affiche les messages vocaux dans le panneau Conversation (les messages clavier le sont déjà par Textual)
+            if getattr(entrant, "source", "") == "voix":
+                panels.ecrire_chat(f"\nVous (voix) : {prompt_effectif}")
 
-                if REGEX_CAPTURE_PHOTO.search(msg):
-                    res_photo = perception.capturer_photo()
-                    panels.ecrire_chat(f"-> Eon [Caméra] : {res_photo}\n")
-                    continue
-
-                modele_force: str | None = None
-                prompt_effectif = msg
-                images_tour: list[bytes] | None = None
-
-                if attente_confirmation_web_texte and dernier_modele and not msg.startswith("@"):
-                    est_oui, detail = app.routeur.interpreter_consentement(msg)
-                    panels.ecrire_chat(f"  [Réponse Web : {'OUI' if est_oui else 'NON'} | {detail}]")
-                    modele_force = dernier_modele
-                    if est_oui:
-                        app.web_preautorise_tour = True
-                        prompt_effectif = f"{msg}\n[AUTORISATION ACCORDÉE : Appelle `rechercher_sur_internet` maintenant.]"
-                    else:
-                        prompt_effectif = f"{msg}\n[AUTORISATION REFUSÉE : N'utilise pas Internet.]"
-                    attente_confirmation_web_texte = False
-                elif msg.startswith("@"):
-                    morceaux = msg[1:].split(maxsplit=1)
-                    if len(morceaux) < 2:
-                        panels.ecrire_chat("[Erreur] Précise un prompt après @<modèle> (ex: @code lis main.py).\n")
-                        continue
-                    modele_trouve = app.routeur.resoudre_modele(morceaux[0])
-                    if not modele_trouve:
-                        panels.ecrire_chat(f"[Erreur] Modèle inconnu : @{morceaux[0]} (tape /models).\n")
-                        continue
-                    modele_force = modele_trouve
-                    prompt_effectif = morceaux[1].strip()
-                    if app.routeur.config["routes"].get(modele_force, {}).get("role") == "vision_multimodale":
-                        images_tour = _extraire_image_camera_bytes(perception)
-
-                # Routage direct en 1 seule passe vers gemma3:12b-it-qat uniquement pour l'analyse visuelle fine
-                if modele_force is None and REGEX_VISION_COMPLEXE.search(prompt_effectif):
-                    modele_vlm = app.routeur.modele_par_role("vision_multimodale")
-                    imgs = _extraire_image_camera_bytes(perception)
-                    if imgs:
-                        modele_force = modele_vlm
-                        images_tour = imgs
-                        panels.log_perception("Routage direct VLM (1 passe) vers gemma3:12b-it-qat.")
-
-                if (
-                    dernier_modele
-                    and dernier_modele != modele_phatique
-                    and dernier_prompt_valide
-                    and derniere_reponse_valide is not None
-                ):
-                    if modele_force and modele_force != dernier_modele:
-                        marquer_dernier_echange_echec("Forçage manuel @alias au tour suivant", modele_corrige=modele_force)
-                    else:
-                        est_echec, detail_echec = app.routeur.evaluer_insatisfaction(
-                            prompt_effectif,
-                            dernier_prompt_valide,
-                            derniere_reponse_valide,
-                        )
-                        if est_echec:
-                            marquer_dernier_echange_echec(f"{detail_echec} -> « {msg} »")
-
-                t0 = time.perf_counter()
-                modele_initial, sim, raison = app.routeur.choisir_modele(
+            # 1. Évaluation d'insatisfaction / rejet de la réponse précédente
+            est_echec = False
+            if self.dernier_prompt_valide and self.derniere_reponse_valide:
+                est_echec, raison_echec = self.routeur.evaluer_insatisfaction(
                     prompt_effectif,
-                    dernier_modele=dernier_modele,
-                    modele_force=modele_force,
-                    modele_verrouille=app.modele_verrouille,
+                    self.dernier_prompt_valide,
+                    self.derniere_reponse_valide,
                 )
-                dt_route = (time.perf_counter() - t0) * 1000
-                panels.ecrire_chat(f"-> {modele_initial} [{raison} | conf: {sim:.2f} | routage: {dt_route:.1f} ms]\n")
+                if est_echec:
+                    _log_outil(f"[AUTO-CORRECTION] Insatisfaction détectée ({raison_echec}).")
+                    try:
+                        marquer_dernier_echange_echec(f"{raison_echec} | Retour utilisateur : {prompt_effectif[:160]}")
+                    except Exception:
+                        pass
 
-                perception.interruption_event.clear()
-                perception.ia_en_cours.set()
+            # 2. Gestionnaire de contexte 3 niveaux (VRAM / RAM / Disque)
+            if self.compresseur is not None:
+                texte_routage, mode_ctx, historique_tour = self.compresseur.preparer_contexte_routage(prompt_effectif)
+                if mode_ctx in ("rupture_sujet", "rappel_disque"):
+                    _log_outil(f"[MÉMOIRE 3-NIVEAUX] Transition : {mode_ctx}")
+                    if mode_ctx == "rupture_sujet":
+                        self.dernier_modele = None
+            else:
+                texte_routage = prompt_effectif
+                historique_tour = []
+
+            # 3. Analyse sémantique des intentions latentes (sans regex)
+            intentions = self.routeur.analyser_intentions(
+                prompt_effectif,
+                dernier_prompt=self.dernier_prompt_valide,
+                derniere_reponse=self.derniere_reponse_valide,
+            )
+            seuil_intent = float(
+                self.routeur.config.get("routage", {}).get("seuils", {}).get("intention_outil") or 0.58
+            )
+
+            if intentions.get("purge_contexte", 0.0) >= seuil_intent or est_echec:
+                historique_tour = []
+                if self.compresseur is not None:
+                    with self.compresseur._lock:
+                        self.compresseur.resume_actif = ""
+                        self.compresseur.vecteur_actif = []
+                        self.compresseur.fenetre_ram.clear()
+                _log_outil("[CONTEXTE] Historique actif purgé pour repartir sur une base saine.")
+
+            # Attachement webcam direct en 1 passe si intention visuelle détectée
+            images_tour: list[bytes] | None = None
+            if modele_force is None and intentions.get("vision_camera", 0.0) >= seuil_intent:
+                modele_vlm = self._obtenir_modele_vlm()
+                imgs = _extraire_image_camera_bytes(self.perception)
+                if modele_vlm and imgs:
+                    modele_force = modele_vlm
+                    images_tour = imgs
+                    _log_outil(f"[VISION 1-PASSE] Frame webcam jointe directement à {modele_vlm}.")
+
+            # Directives système dynamiques selon les intentions sémantiques
+            forcer_web = False
+            consignes_dynamiques: list[str] = []
+            if intentions.get("web_obligatoire", 0.0) >= seuil_intent:
+                forcer_web = True
+                consignes_dynamiques.append(
+                    "Appelle obligatoirement `rechercher_sur_internet` avant de répondre et base-toi uniquement sur ses résultats."
+                )
+            if intentions.get("export_historique", 0.0) >= seuil_intent:
+                consignes_dynamiques.append(
+                    "Utilise l'outil `exporter_historique` (ou `consulter_historique`) pour récupérer les vrais échanges sans jamais les inventer."
+                )
+
+            prompt_pour_llm = prompt_effectif
+            if consignes_dynamiques:
+                prompt_pour_llm += "\n[CONSIGNE SYSTÈME : " + " ".join(consignes_dynamiques) + "]"
+
+            # 4. Choix du modèle optimal (Embedding contextualisé + Superviseur IA)
+            modele_final, score_route, raison_route = self.routeur.choisir_modele(
+                texte_routage,
+                dernier_modele=self.dernier_modele,
+                modele_force=modele_force,
+                modele_verrouille=self.modele_verrouille,
+                dernier_prompt=self.dernier_prompt_valide,
+                derniere_reponse=self.derniere_reponse_valide,
+            )
+            route_cfg = self.routeur.config.get("routes", {}).get(modele_final, {})
+            _log_outil(f"[ROUTE] {modele_final} (score={score_route:.2f} | {raison_route})")
+
+            # 5. Exécution autonome (streaming + outils)
+            reponse = self.executer_tour_autonome(
+                modele=modele_final,
+                route_cfg=route_cfg,
+                prompt_utilisateur=prompt_pour_llm,
+                historique=historique_tour,
+                images=images_tour,
+                forcer_web=forcer_web,
+            )
+
+            # 6. Mise à jour mémoire SQLite + compression asynchrone en RAM (0 ms de latence)
+            if reponse:
+                self.dernier_modele = modele_final
+                self.dernier_prompt_valide = prompt_effectif
+                self.derniere_reponse_valide = reponse
+
                 try:
-                    rep, modele_final, outils_utilises, modele_delegue = app.executer_tour_autonome(
-                        prompt_effectif,
-                        modele_initial,
-                        session_id=session_courante,
-                        interruption_event=perception.interruption_event,
-                        images_tour=images_tour,
+                    journaliser_echange(
+                        {
+                            "session_id": self.session_id,
+                            "date": datetime.datetime.now().isoformat(timespec="seconds"),
+                            "modele": modele_final,
+                            "raison": raison_route,
+                            "score": score_route,
+                            "source": entrant.source,
+                            "prompt": prompt_effectif,
+                            "reponse": reponse,
+                        }
                     )
-                except Exception as e:
-                    panels.ecrire_chat(f"\n[Erreur Ollama] : {e}\n")
-                    app.web_preautorise_tour = False
-                    continue
-                finally:
-                    perception.ia_en_cours.clear()
+                except Exception:
+                    pass
 
-                if perception.interruption_event.is_set():
-                    panels.ecrire_chat("\n[Eon interrompu — à l'écoute]\n")
+                if self.compresseur is not None:
+                    self.compresseur.mettre_a_jour_asynchrone(prompt_effectif, reponse, modele_final)
 
-                app.web_preautorise_tour = False
-                dernier_modele = modele_final
-                dernier_prompt_valide = msg
-                derniere_reponse_valide = rep
-                attente_confirmation_web_texte = bool("?" in rep and REGEX_PROPOSITION_WEB_TEXTE.search(rep))
 
-                dt_total = (time.perf_counter() - t0) * 1000
-                panels.ecrire_chat(f"\n(-> total {dt_total:.1f} ms)\n")
+def main() -> None:
+    app = ApplicationEon()
 
-                entree_log = {
-                    "session_id": session_courante,
-                    "date": datetime.now().isoformat(timespec="seconds"),
-                    "modele": modele_final,
-                    "modele_initial": modele_initial,
-                    "raison": raison,
-                    "score": round(sim, 4),
-                    "outils_utilises": outils_utilises,
-                    "prompt": msg,
-                    "reponse": rep,
-                }
-                if modele_delegue:
-                    entree_log["echec_detecte"] = True
-                    entree_log["raison_echec"] = f"Auto-transfert de {modele_initial} vers {modele_delegue}"
-                    entree_log["modele_attendu"] = modele_delegue
-
-                journaliser_echange(entree_log)
-            finally:
-                perception.autoriser_saisie()
+    try:
+        panels.enregistrer_callbacks_ui(
+            on_prompt=app.perception.soumettre_texte_clavier,
+            on_escape=app.perception.declencher_interruption,
+        )
+        panels.lancer_avec_interface(BASE_DIR, app.boucle_principale)
     except KeyboardInterrupt:
-        perception.arret_global.set()
+        pass
     finally:
-        perception.arret_global.set()
+        app.perception.arret_global.set()
+        panels.fermer()
 
 
 if __name__ == "__main__":
-    if "--optimize" in sys.argv:
-        print(executer_optimisation_nocturne())
-        sys.exit(0)
-
-    panels.lancer_avec_interface(BASE_DIR, boucle_principale)
+    main()

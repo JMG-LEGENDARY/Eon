@@ -1,14 +1,11 @@
 {
-  "web_mode": "auto",
+  "web_mode": "ask",
   "file_mode": "ask",
-  "shell_mode": "auto",
-  "modele_optimiseur": "qwen2.5-coder:7B",
+  "shell_mode": "ask",
+  "modele_optimiseur": "qwen2.5:7B",
   "route_defaut": "qwen2.5:7B",
   "regles_apprises": [
-    "Identifiez clairement si la requête est une demande de description générale ou une demande de détails supplémentaires.",
-    "Indiquez clairement si l'accès à Internet est nécessaire pour la réponse.",
-    "Identifiez clairement si la requête est une instruction verbale ou une description d'action.",
-    "Identifiez clairement si la requête est une blague ou une action inappropriée."
+    "ajouter un contexte pour les modifications de code source"
   ],
   "routage": {
     "utiliser_embeddings": true,
@@ -16,7 +13,10 @@
     "seuils": {
       "confiance": 0.54,
       "marge": 0.03,
-      "insatisfaction": 0.62
+      "insatisfaction": 0.675,
+      "confiance_directe": 0.625,
+      "marge_directe": 0.05,
+      "intention_outil": 0.58
     },
     "mots_cles_lourds": [
       "architecture",
@@ -53,7 +53,9 @@
       }
     ],
     "pattern_continuation_action": "^(fais[- ]le|fais[- ]la|ex[ée]cute([- ]le|-la)?|lance([- ]le|-la)?|vas[- ]y|essaie|teste|appliques?[- ]le)[!?.…\\s]*$",
-    "pattern_rupture_relance": "^(lis|lire|affiche|montre|liste|cherche|modifie|crée|ex[ée]cute|lance|quel\\s+mod[èe]le|quelle\\s+ia|qui\\s+peut|qu'est-ce\\s+que\\s+tu\\s+peux)\\b"
+    "pattern_rupture_relance": "^(lis|lire|affiche|montre|liste|cherche|modifie|crée|ex[ée]cute|lance|quel\\s+mod[èe]le|quelle\\s+ia|qui\\s+peut|qu'est-ce\\s+que\\s+tu\\s+peux)\\b",
+    "superviseur_model": "qwen3:0.6b",
+    "utiliser_superviseur_ia": true
   },
   "signaux": {
     "consentement_oui": [
@@ -117,11 +119,7 @@
       "tu comprends rien à ce que je dis",
       "c'est faux et hors sujet",
       "tu es en totale hallucination",
-      "pfff laisse tomber t'es nul",
-      "mais tu as accès à la caméra",
-      "attendu, tu es censé pouvoir aller sur internet",
-      "réponse basée sur une fausse information",
-      "bah nonmdr"
+      "pfff laisse tomber t'es nul"
     ]
   },
   "routes": {
@@ -143,7 +141,7 @@
       "expertise": "Discussion libre, humour, brainstorming, ton naturel sans filtre ni rigidité.",
       "temperature": 0.8,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 512,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,
@@ -161,7 +159,7 @@
       "expertise": "Culture générale, explications théoriques, synthèse, recherche Internet et mémoire utilisateur.",
       "temperature": 0.25,
       "num_ctx": 8192,
-      "num_predict": null,
+      "num_predict": 768,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,
@@ -178,7 +176,7 @@
       "expertise": "Administration système Linux/Fedora, commandes terminal bash, lecture/édition de fichiers locaux, scripts Python/Rust/C.",
       "temperature": 0.15,
       "num_ctx": 8192,
-      "num_predict": null,
+      "num_predict": 1024,
       "web_tools": true,
       "file_tools": true,
       "shell_tools": true,
@@ -194,7 +192,7 @@
       "expertise": "Refactoring complexe multi-fichiers, architecture logicielle lourde et debugging bas niveau (plus lent, sollicite le CPU).",
       "temperature": 0.15,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 1280,
       "web_tools": true,
       "file_tools": true,
       "shell_tools": true,
@@ -209,7 +207,7 @@
       "expertise": "Reformulation de textes brouillons, extraction d'intentions complexes ou dictées vocales mal structurées.",
       "temperature": 0.3,
       "num_ctx": 4096,
-      "num_predict": null,
+      "num_predict": 512,
       "web_tools": true,
       "file_tools": false,
       "shell_tools": false,

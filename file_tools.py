@@ -1,24 +1,30 @@
 import difflib
 import os
+import re
 from pathlib import Path
 from typing import Callable
 
 import terminal_panels as panels
 
+BASE_DIR = Path(__file__).resolve().parent
 DOSSIERS_IGNORES = {
     ".git", ".venv", "venv", "__pycache__", "node_modules",
     "target", ".idea", ".mypy_cache", ".pytest_cache", "archives_logs",
 }
 RACINE_AUTORISEE = Path.home().resolve()
 
-MODE_FICHIERS = "ask"  # "ask" | "auto" | "ro"
+# La confirmation interactive est gérée en amont par main.py (ou via CALLBACK_CONFIRMATION)
+MODE_FICHIERS = "auto"  # "ask" | "auto" | "ro"
 CALLBACK_CONFIRMATION: Callable[[str, str], bool] | None = None
 
 
 def _resoudre_chemin(chemin: str) -> Path:
-    p = Path(chemin).expanduser()
+    nettoye = re.sub(r"/\s+", "/", chemin.strip().strip("\"'"))
+    p = Path(nettoye).expanduser()
     if not p.is_absolute():
-        p = (Path.cwd() / p).resolve()
+        candidat_cwd = (Path.cwd() / p).resolve()
+        candidat_base = (BASE_DIR / p).resolve()
+        p = candidat_cwd if candidat_cwd.exists() else candidat_base
     else:
         p = p.resolve()
 
@@ -35,7 +41,7 @@ def _ecrire_atomique(cible: Path, contenu: str) -> None:
 
 def _verifier_autorisation_ecriture(action: str, detail: str) -> tuple[bool, str]:
     if MODE_FICHIERS == "ro":
-        return False, "REFUS SYSTÈME : Le mode fichiers est en lecture seule (/files ro)."
+        return False, "REFUS SYSTÈME : Le mode fichiers est en lecture seule (/file ro)."
     if MODE_FICHIERS == "auto":
         return True, ""
     if CALLBACK_CONFIRMATION and CALLBACK_CONFIRMATION(action, detail):

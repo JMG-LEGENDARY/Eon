@@ -8,19 +8,19 @@
   "materiel_projets": {},
   "quotidien": {},
   "os_version": {
-    "valeur": "7.3.3-200.fc44.x86_64",
-    "maj": "2026-11-17T21:52:28"
+    "valeur": "Fedora",
+    "maj": "2026-11-19T20:04:27"
   },
   "architecture": {
-    "valeur": "x86_64",
-    "maj": "2026-11-17T21:52:28"
+    "valeur": "Non spécifiée",
+    "maj": "2026-11-19T20:04:27"
   },
   "python_version": {
-    "valeur": "3.14.10",
-    "maj": "2026-11-17T21:52:28"
+    "valeur": "Non spécifiée",
+    "maj": "2026-11-19T20:04:27"
   },
   "current_directory": {
-    "valeur": "/home/jmg/Documents/MOI/IA",
-    "maj": "2026-11-17T21:52:28"
+    "valeur": "Non spécifiée",
+    "maj": "2026-11-19T20:04:27"
   }
 }

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import threading
 import zlib
@@ -120,7 +121,6 @@ def _migrer_anciennes_archives(conn: sqlite3.Connection) -> None:
         try:
             brut = HISTORIQUE_BIN_FILE.read_bytes()
             cle = _obtenir_cle()
-            # Compatibilité avec l'ancien masque XOR cyclique (32 octets)
             compresse = bytes(b ^ cle[i % len(cle)] for i, b in enumerate(brut))
             texte = zlib.decompress(compresse).decode("utf-8")
             anciens = _parser_lignes_jsonl(texte)
@@ -136,6 +136,7 @@ def _migrer_anciennes_archives(conn: sqlite3.Connection) -> None:
 
 
 def _inserer_ligne_db(conn: sqlite3.Connection, entree: dict[str, Any]) -> None:
+    date_val = entree.get("date") or entree.get("timestamp") or datetime.now().isoformat(timespec="seconds")
     conn.execute(
         """
         INSERT INTO echanges (
@@ -145,7 +146,7 @@ def _inserer_ligne_db(conn: sqlite3.Connection, entree: dict[str, Any]) -> None:
         """,
         (
             entree.get("session_id", ""),
-            entree.get("date", datetime.now().isoformat(timespec="seconds")),
+            date_val,
             entree.get("modele", ""),
             entree.get("modele_initial", ""),
             entree.get("raison", ""),
@@ -311,7 +312,7 @@ def formater_contexte_memoire() -> str:
 
 def consulter_historique(limite: int = 10, inclure_episodes: bool = True) -> str:
     """Consulte l'historique des conversations passées et les résumés journaliers."""
-    nb = max(1, min(int(limite), 30))
+    nb = max(1, min(int(limite), 150))
     sections: list[str] = []
 
     with _DB_LOCK:
@@ -323,10 +324,11 @@ def consulter_historique(limite: int = 10, inclure_episodes: bool = True) -> str
 
     if rows:
         entrees = []
+        troncature = 140 if nb > 40 else 220
         for d in reversed(rows):
             flag = " [ÉCHEC]" if d["echec_detecte"] else ""
             p = str(d["prompt"] or "").replace("\n", " ")
-            r = str(d["reponse"] or "").replace("\n", " ")[:180]
+            r = str(d["reponse"] or "").replace("\n", " ")[:troncature]
             entrees.append(f"- [{d['date']}] ({d['modele']}){flag} Moi: {p}\n  IA: {r}...")
         sections.append(f"ÉCHANGES RÉCENTS ({len(entrees)} derniers) :\n" + "\n".join(entrees))
 
@@ -342,6 +344,87 @@ def consulter_historique(limite: int = 10, inclure_episodes: bool = True) -> str
                 sections.append("RÉSUMÉS ÉPISODIQUES :\n" + "\n".join(lignes_ep))
 
     return "\n\n".join(sections) if sections else "Aucun historique enregistré pour le moment."
+
+
+def rechercher_dans_historique(requete: str, limite: int = 15) -> str:
+    """Recherche des échanges passés contenant un mot ou sujet précis dans la base SQLite."""
+    motif = requete.strip()
+    if not motif:
+        return "Erreur : terme de recherche vide."
+    nb = max(1, min(int(limite), 50))
+    like_arg = f"%{motif}%"
+
+    with _DB_LOCK:
+        conn = _connexion_db()
+        rows = conn.execute(
+            """
+            SELECT date, modele, prompt, reponse FROM echanges
+            WHERE prompt LIKE ? OR reponse LIKE ?
+            ORDER BY id DESC LIMIT ?
+            """,
+            (like_arg, like_arg, nb),
+        ).fetchall()
+
+    if not rows:
+        return f"Aucun échange trouvé dans l'historique pour « {motif} »."
+
+    lignes = [f"Résultats dans l'historique pour « {motif} » ({len(rows)} trouvé(s)) :"]
+    for d in reversed(rows):
+        p = str(d["prompt"] or "").replace("\n", " ")
+        r = str(d["reponse"] or "").replace("\n", " ")[:240]
+        lignes.append(f"- [{d['date']}] ({d['modele']}) Moi: {p}\n  IA: {r}...")
+    return "\n".join(lignes)
+
+
+def exporter_historique(
+    chemin_destination: str = "~/Téléchargements/conversation_eon.txt",
+    limite: int = 100,
+) -> str:
+    """Exporte les vrais échanges enregistrés depuis la base SQLite vers un fichier texte sur le disque."""
+    nettoye = re.sub(r"/\s+", "/", (chemin_destination or "").strip().strip("\"'"))
+    cible = Path(nettoye or "~/Téléchargements/conversation_eon.txt").expanduser()
+    if not cible.is_absolute():
+        cible = (Path.home() / "Téléchargements" / cible).resolve()
+    else:
+        cible = cible.resolve()
+
+    if cible.exists() and cible.is_dir():
+        cible = cible / "conversation_eon.txt"
+
+    racine_home = Path.home().resolve()
+    if racine_home not in cible.parents and cible != racine_home:
+        return f"Erreur : chemin d'export refusé hors de {racine_home} ({cible})."
+
+    nb = max(1, min(int(limite), 1000))
+    with _DB_LOCK:
+        conn = _connexion_db()
+        rows = conn.execute(
+            """
+            SELECT date, modele, echec_detecte, prompt, reponse
+            FROM echanges
+            WHERE prompt != ''
+            ORDER BY id DESC LIMIT ?
+            """,
+            (nb,),
+        ).fetchall()
+
+    lignes_sortie = [
+        f"=== HISTORIQUE RÉEL DE CONVERSATION EON (exporté le {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}) ===",
+        f"Total exporté : {len(rows)} échange(s)",
+        "=" * 72,
+        "",
+    ]
+
+    for idx, d in enumerate(reversed(rows), start=1):
+        statut = " [ÉCHEC SIGNALÉ]" if d["echec_detecte"] else ""
+        lignes_sortie.append(f"[{idx}] {d['date']} | Modèle : {d['modele']}{statut}")
+        lignes_sortie.append(f"Moi : {d['prompt']}")
+        lignes_sortie.append(f"Eon : {d['reponse']}")
+        lignes_sortie.append("-" * 72)
+
+    cible.parent.mkdir(parents=True, exist_ok=True)
+    _ecrire_atomique_texte(cible, "\n".join(lignes_sortie) + "\n")
+    return f"Historique réel exporté avec succès ({len(rows)} échanges) dans : {cible}"
 
 
 def effacer_historique_jour() -> int:

@@ -11,7 +11,7 @@ from typing import Callable
 import terminal_panels as panels
 
 BASE_DIR = Path(__file__).resolve().parent
-MODE_SHELL = "ask"  # "ask" | "auto" | "off"
+MODE_SHELL = "auto"  # La confirmation est gérée en amont par main.py (ou via CALLBACK_CONFIRMATION)
 CALLBACK_CONFIRMATION: Callable[[str], bool] | None = None
 
 COMMANDES_BLOQUEES = re.compile(
@@ -22,6 +22,7 @@ COMMANDES_BLOQUEES = re.compile(
 )
 REGEX_SUDO = re.compile(r"(^|[;&|]\s*)sudo\b")
 REGEX_COMMANDE_LONGUE = re.compile(r"\b(dnf|flatpak|cargo|pip|uv|npm|git\s+clone)\b", re.IGNORECASE)
+REGEX_DNF_INTERACTIF = re.compile(r"\bdnf\s+(install|upgrade|update|remove|autoremove)\b(?![^\n;|&]*\s-y\b)", re.IGNORECASE)
 
 
 @dataclass
@@ -88,6 +89,17 @@ def statut_tache_en_cours() -> str:
     )
 
 
+def _normaliser_commande_llm(commande: str) -> str:
+    """Corrige les artefacts d'échappement JSON courants produits par les LLM locaux."""
+    cmd = commande.strip()
+    # Corrige les subshells mal échappés par le parser JSON (ex: `\\(seq 1 10\\)` -> `$(seq 1 10)`)
+    cmd = re.sub(r"\\+\(([^()]+)\\+\)", r"$(\1)", cmd)
+    # Évite qu'un dnf interactif se fige sur [o/N]
+    if REGEX_DNF_INTERACTIF.search(cmd):
+        cmd = REGEX_DNF_INTERACTIF.sub(r"dnf -y \1", cmd)
+    return cmd
+
+
 def _preparer_sudo(commande: str) -> tuple[str, str | None]:
     if not REGEX_SUDO.search(commande):
         return commande, None
@@ -127,7 +139,7 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
             "Demande à l'utilisateur s'il souhaite l'arrêter avant d'en lancer une autre."
         )
 
-    cmd_propre = commande.strip()
+    cmd_propre = _normaliser_commande_llm(commande)
     if not cmd_propre:
         return "Erreur : commande vide."
 
@@ -143,9 +155,7 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
     if not cwd.exists() or not cwd.is_dir():
         cwd = BASE_DIR
 
-    if MODE_SHELL == "ask":
-        if CALLBACK_CONFIRMATION is None:
-            return "Erreur : aucun callback de confirmation configuré."
+    if MODE_SHELL == "ask" and CALLBACK_CONFIRMATION is not None:
         if not CALLBACK_CONFIRMATION(f"[{cwd}] $ {cmd_propre}"):
             return "REFUS UTILISATEUR : l'utilisateur a refusé d'exécuter cette commande. Ne la simule pas."
 
@@ -157,11 +167,16 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
     delai_max = 900 if REGEX_COMMANDE_LONGUE.search(cmd_propre) else 45
     panels.log_outil(f"$ {cmd_propre}")
 
+    env_exec = os.environ.copy()
+    env_exec["GIT_TERMINAL_PROMPT"] = "0"
+    env_exec["DEBIAN_FRONTEND"] = "noninteractive"
+
     try:
         proc = subprocess.Popen(
             cmd_exec,
             shell=True,
             cwd=str(cwd),
+            env=env_exec,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -221,9 +236,13 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
             sortie_complete = "\n".join(tache.lignes).strip()
             if len(sortie_complete) > 4000:
                 sortie_complete = sortie_complete[:1500] + "\n... [milieu tronqué] ...\n" + sortie_complete[-2200:]
+
             info_code = f"Code retour : {tache.code_retour}"
             if "check-update" in cmd_propre and tache.code_retour == 100:
                 info_code += " (des mises à jour sont disponibles)"
+            elif tache.code_retour != 0:
+                info_code += " (ÉCHEC DE LA COMMANDE : ne prétends pas qu'elle a réussi, analyse l'erreur ci-dessous)"
+
             return f"{info_code}\nSORTIE :\n{sortie_complete}" if sortie_complete else f"{info_code}\n(Aucune sortie texte)"
 
         extrait_debut = "\n".join(tache.lignes[-6:]).strip()

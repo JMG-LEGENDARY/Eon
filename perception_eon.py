@@ -61,6 +61,23 @@ COCO_CLASSES_FR = {
     73: "livre",
 }
 
+# Détection du mot-clé "Éon" (y compris variantes phonétiques fréquentes de Whisper en français)
+REGEX_WAKE_WORD = re.compile(
+    r"(?:\b(?:[ée]on|eon|h[ée]on|eyon|ayon)\b|^(?:eh\s+on|et\s+on)\s*[,!?])",
+    re.IGNORECASE,
+)
+
+BRUITS_PARASITES_WHISPER = {
+    "sous-titres réalisés par la communauté d'amara.org",
+    "sous-titrage st' 501",
+    "merci d'avoir regardé",
+    "merci d'avoir regardé cette vidéo",
+    "à bientôt",
+    "merci.",
+    "merci",
+    "...",
+}
+
 
 @dataclass
 class MessageEntrant:
@@ -78,8 +95,22 @@ def _cosinus(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
+def _iou_boites(b1: tuple[int, int, int, int], b2: tuple[int, int, int, int]) -> float:
+    x1, y1, w1, h1 = b1
+    x2, y2, w2, h2 = b2
+    xa = max(x1, x2)
+    ya = max(y1, y2)
+    xb = min(x1 + w1, x2 + w2)
+    yb = min(y1 + h1, y2 + h2)
+    inter = max(0, xb - xa) * max(0, yb - ya)
+    if inter == 0:
+        return 0.0
+    union = (w1 * h1) + (w2 * h2) - inter
+    return inter / float(max(1, union))
+
+
 class PerceptionEon:
-    """Perception continue basse consommation (CPU) + escalade multimodale (gemma3:12b-it-qat)."""
+    """Perception continue basse consommation (CPU, 0 Mo VRAM) + escalade multimodale (gemma3:12b-it-qat)."""
 
     def __init__(
         self,
@@ -130,9 +161,12 @@ class PerceptionEon:
         self._initialiser_modeles_vision_cpu()
 
         self._whisper = None
+        self._lock_whisper = threading.Lock()
+        self._transcriptions_en_attente = 0
         self._installer_signal_interruption()
 
     # ---------------- CONTRÔLES UI & INTERRUPTION ----------------
+
     def _dimension_attendue_visage(self) -> int:
         return 128 if self._sface is not None else 288
 
@@ -152,7 +186,7 @@ class PerceptionEon:
         self.file_messages.put(MessageEntrant(texte=propre, source="clavier"))
 
     def declencher_interruption(self) -> None:
-        """Appelé par la touche Échap (Textual ou TTY) ou le barge-in vocal."""
+        """Appelé par la touche Échap (Textual ou TTY) ou le barge-in vocal validé."""
         if self.ia_en_cours.is_set():
             self.interruption_event.set()
 
@@ -177,7 +211,6 @@ class PerceptionEon:
                     if vec:
                         self.profils_visages[nom] = np.array(vec, dtype=np.float32)
             elif data.get("visage"):
-                # Migration automatique de l'ancien profil unique
                 self.profils_visages["Bryan"] = np.array(data["visage"], dtype=np.float32)
 
             if data.get("voix"):
@@ -226,7 +259,6 @@ class PerceptionEon:
             return
         MODELS_VISION_DIR.mkdir(parents=True, exist_ok=True)
 
-        # 1. Détecteur objets/personnes YOLO11n/YOLOv8n ONNX (CPU) ou repli HOG OpenCV
         for nom_yolo in ("yolo11n.onnx", "yolov8n.onnx"):
             chemin_yolo = MODELS_VISION_DIR / nom_yolo
             if chemin_yolo.exists():
@@ -244,12 +276,13 @@ class PerceptionEon:
             hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
             self._hog_personnes = hog
 
-        # 2. Détecteur & encodeur facial YuNet + SFace ONNX (natif OpenCV, ~10 ms CPU)
+        # Seuil YuNet relevé à 0.85 (au lieu de 0.72) pour éliminer les faux visages en arrière-plan
         yunet_path = MODELS_VISION_DIR / "face_detection_yunet_2023mar.onnx"
         sface_path = MODELS_VISION_DIR / "face_recognition_sface_2021dec.onnx"
         if yunet_path.exists() and hasattr(cv2, "FaceDetectorYN"):
             try:
-                self._yunet = cv2.FaceDetectorYN.create(str(yunet_path), "", (320, 320), 0.72, 0.3, 5000)
+                seuil_yunet = float(self.cfg.get("seuil_detection_visage", 0.85))
+                self._yunet = cv2.FaceDetectorYN.create(str(yunet_path), "", (320, 320), seuil_yunet, 0.3, 50)
             except Exception:
                 self._yunet = None
         if sface_path.exists() and hasattr(cv2, "FaceRecognizerSF"):
@@ -266,9 +299,9 @@ class PerceptionEon:
             blob = cv2.dnn.blobFromImage(frame, 1.0 / 255.0, (640, 640), swapRB=True, crop=False)
             self._yolo_net.setInput(blob)
             out = self._yolo_net.forward()
-            preds = np.squeeze(out[0]).T  # (8400, 84)
+            preds = np.squeeze(out[0]).T
             scores = np.max(preds[:, 4:], axis=1)
-            masque = scores >= 0.45
+            masque = scores >= 0.50
             preds_valides = preds[masque]
             scores_valides = scores[masque]
             if len(preds_valides) == 0:
@@ -281,7 +314,7 @@ class PerceptionEon:
                 y1 = int((cy - h / 2.0) * h_img / 640.0)
                 boites.append([x1, y1, int(w * w_img / 640.0), int(h * h_img / 640.0)])
 
-            indices = cv2.dnn.NMSBoxes(boites, scores_valides.tolist(), 0.45, 0.45)
+            indices = cv2.dnn.NMSBoxes(boites, scores_valides.tolist(), 0.50, 0.40)
             nb_pers = 0
             compteur_objets: dict[str, int] = {}
             if len(indices) > 0:
@@ -296,11 +329,10 @@ class PerceptionEon:
             objets = [f"{k} (x{v})" if v > 1 else k for k, v in compteur_objets.items()]
             return nb_pers, objets
 
-        # Repli HOG OpenCV si YOLO ONNX n'est pas encore déposé dans models_vision/
         if self._hog_personnes is not None:
             petite = cv2.resize(frame, (320, 240))
-            rects, weights = self._hog_personnes.detectMultiScale(petite, winStride=(8, 8), padding=(8, 8), scale=1.08)
-            nb_pers = sum(1 for w in weights if float(w) > 0.65) if len(weights) > 0 else 0
+            _, weights = self._hog_personnes.detectMultiScale(petite, winStride=(8, 8), padding=(8, 8), scale=1.08)
+            nb_pers = sum(1 for w in weights if float(w) > 0.70) if len(weights) > 0 else 0
             return nb_pers, []
 
         return 0, []
@@ -315,18 +347,24 @@ class PerceptionEon:
         norme = float(np.linalg.norm(vec))
         return vec / norme if norme > 0 else vec
 
-    def _identifier_visage(self, vec: np.ndarray) -> tuple[str, float]:
-        """Compare un vecteur facial à tous les résidents enregistrés."""
+    def _identifier_visage(
+        self,
+        vec: np.ndarray,
+        identites_deja_attribuees: set[str] | None = None,
+    ) -> tuple[str, float]:
+        """Compare un vecteur facial aux résidents enregistrés sans autoriser de clones sur la même frame."""
         profils_valides = self._profils_visages_compatibles()
         if not profils_valides:
             return "Non calibré", 0.0
 
+        deja_pris = identites_deja_attribuees or set()
         meilleur_nom = "Inconnu"
         meilleur_score = -1.0
-        seuil = 0.37 if self._sface is not None else 0.76
+        # Seuil SFace relevé à 0.46 (vs 0.37) pour éviter de reconnaître n'importe quoi comme Bryan
+        seuil = float(self.cfg.get("seuil_visage_sface", 0.46)) if self._sface is not None else 0.78
 
         for nom, ref in profils_valides.items():
-            if ref.shape != vec.shape:
+            if nom in deja_pris or ref.shape != vec.shape:
                 continue
             if self._sface is not None:
                 score = float(self._sface.match(ref.reshape(1, -1), vec.reshape(1, -1), cv2.FaceRecognizerSF_FR_COSINE))
@@ -337,15 +375,18 @@ class PerceptionEon:
                 meilleur_nom = nom
 
         if meilleur_score >= seuil:
-            # Mise à jour adaptative douce du profil reconnu
-            self.profils_visages[meilleur_nom] = 0.92 * self.profils_visages[meilleur_nom] + 0.08 * vec
+            # Mise à jour adaptative uniquement si la confiance est très élevée (>= 0.62)
+            if meilleur_score >= 0.62:
+                nouveau_ref = 0.94 * self.profils_visages[meilleur_nom] + 0.06 * vec
+                norme = float(np.linalg.norm(nouveau_ref))
+                if norme > 0:
+                    self.profils_visages[meilleur_nom] = nouveau_ref / norme
             return meilleur_nom, round(meilleur_score, 2)
         return "Inconnu", round(max(0.0, meilleur_score), 2)
 
     # ---------------- ESCALADE SÉMANTIQUE VERS GEMMA 3 12B ----------------
 
     def _analyser_intrusion_vlm(self, frame: np.ndarray, motif_declenchement: str) -> None:
-        """Réveille gemma3:12b-it-qat uniquement lorsqu'un inconnu est seul dans la pièce."""
         dossier_alertes = BASE_DIR / "captures" / "alertes"
         dossier_alertes.mkdir(parents=True, exist_ok=True)
         chemin_img = dossier_alertes / f"alerte_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
@@ -372,7 +413,7 @@ class PerceptionEon:
                 model=modele_vision,
                 messages=[{"role": "user", "content": prompt_secu, "images": [bytes(buf)]}],
                 options={"temperature": 0.1, "num_predict": 120},
-                keep_alive=0,  # Libère immédiatement les 8 Go de VRAM après le diagnostic
+                keep_alive=0,
             )
             brut = rep.get("message", {}).get("content", "").strip()
             match_json = re.search(r"\{.*\}", brut, flags=re.S)
@@ -396,22 +437,21 @@ class PerceptionEon:
 
     # ---------------- API PUBLIQUE CAPTEURS & OUTILS ----------------
 
-    def regarde_ecran_maintenant(self) -> bool:
+    def regarde_ecran_maintenant(self, tolerance_sec: float = 2.0) -> bool:
         if not self.cfg.get("activer_vision_voix", True):
             return True
         if not self.camera_active:
             return False
         with self._lock_vision:
-            return (time.monotonic() - self._dernier_regard_ts) <= 1.5
+            return (time.monotonic() - self._dernier_regard_ts) <= tolerance_sec
 
     def decrire_etat_capteurs(self) -> str:
-        """Fournit la télémétrie visuelle temps réel (CPU) aux LLMs texte sans charger Gemma 3 12B."""
         with self._lock_vision:
             pers = self._nb_personnes_actuel
             ident = ", ".join(self._personnes_identifiees) if self._personnes_identifiees else "aucune"
             objs = ", ".join(self._objets_detectes_actuels) if self._objets_detectes_actuels else "aucun objet notable"
             pos = self._position_visage_actuel or "non cadré"
-            regard = "oui" if (time.monotonic() - self._dernier_regard_ts) <= 1.5 else "non"
+            regard = "oui" if (time.monotonic() - self._dernier_regard_ts) <= 2.0 else "non"
 
         return (
             f"Caméra : {'ACTIVE' if self.camera_active else 'INACTIVE'} ({self.statut_camera}) | "
@@ -442,7 +482,6 @@ class PerceptionEon:
         return f"Capture photo enregistrée sur le disque : {chemin}"
 
     def observer_camera(self, question: str = "Décris objectivement tout ce qui est visible sur l'image.") -> str:
-        """Analyse sémantique fine via gemma3:12b-it-qat (uniquement sur demande explicite)."""
         panels.log_perception(f"Analyse sémantique VLM : {question}")
         if not self.camera_active or cv2 is None:
             return f"Caméra INACTIVE ({self.statut_camera}). Impossible de voir quoi que ce soit."
@@ -469,7 +508,7 @@ class PerceptionEon:
                 model=modele_vision,
                 messages=[{"role": "user", "content": prompt_vision, "images": [bytes(buf)]}],
                 options={"temperature": 0.1},
-                keep_alive=0,  # Libère la VRAM dès la fin de l'analyse visuelle
+                keep_alive=0,
             )
             observation = rep.get("message", {}).get("content", "").strip() or "Aucune description retournée."
             panels.log_perception(f"Observation VLM : {observation[:180]}")
@@ -503,8 +542,6 @@ class PerceptionEon:
         self.camera_active = True
         self.statut_camera = f"active (idx {index_cam}, {moteur_obj}/{moteur_face})"
         panels.log_perception(f"Caméra activée : {self.statut_camera}")
-        if self._yolo_net is None:
-            panels.log_perception("Astuce : dépose yolo11n.onnx dans models_vision/ pour la détection 80 classes.")
 
         dernier_resume_log = ""
         dernier_log_ts = 0.0
@@ -523,7 +560,6 @@ class PerceptionEon:
                 gris = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 luminosite = float(np.mean(gris))
 
-                # 1. Détection corps entier & objets toutes les 2 frames (~15 ms CPU)
                 if frame_idx % 2 == 1:
                     nb_pers_corps, objets_detectes = self._detecter_objets_rapide(frame)
                 else:
@@ -531,8 +567,9 @@ class PerceptionEon:
                         nb_pers_corps = self._nb_personnes_actuel
                         objets_detectes = list(self._objets_detectes_actuels)
 
-                # 2. Détection & identification des visages
                 identites: list[str] = []
+                identites_prises: set[str] = set()
+                boites_retenues: list[tuple[int, int, int, int]] = []
                 regard_resident = False
                 vec_principal: np.ndarray | None = None
                 position_desc = ""
@@ -542,31 +579,42 @@ class PerceptionEon:
                     _, faces = self._yunet.detect(frame)
                     if faces is not None and len(faces) > 0:
                         faces_triees = sorted(faces, key=lambda f: f[2] * f[3], reverse=True)
-                        for idx_f, f in enumerate(faces_triees):
+                        for f in faces_triees:
                             x, y, w, h = int(f[0]), int(f[1]), int(f[2]), int(f[3])
+                            # Ignore les micro-détections fantômes en arrière-plan
+                            if w < 55 or h < 55:
+                                continue
+                            boite = (x, y, w, h)
+                            # Élimine les boîtes doublons superposées sur le même visage
+                            if any(_iou_boites(boite, b_ex) > 0.35 for b_ex in boites_retenues):
+                                continue
+                            boites_retenues.append(boite)
+
                             if self._sface is not None:
                                 aligne = self._sface.alignCrop(frame, f)
                                 vec = self._sface.feature(aligne).flatten()
                             else:
-                                roi = gris[max(0, y): min(h_img, y + h), max(0, x): min(w_img, x + w)]
+                                roi = gris[max(0, y) : min(h_img, y + h), max(0, x) : min(w_img, x + w)]
                                 vec = self._extraire_signature_visage_fallback(roi) if roi.size > 0 else None
 
                             if vec is not None:
-                                nom_id, _ = self._identifier_visage(vec)
+                                nom_id, _ = self._identifier_visage(vec, identites_prises)
+                                if nom_id not in ("Inconnu", "Non calibré"):
+                                    identites_prises.add(nom_id)
                                 identites.append(nom_id)
-                                if idx_f == 0:
+                                if len(boites_retenues) == 1:
                                     vec_principal = vec
                             else:
                                 identites.append("Inconnu")
 
-                            if idx_f == 0:
+                            if len(boites_retenues) == 1:
                                 centre_x = (x + w / 2.0) / float(w_img)
                                 horiz = "gauche" if centre_x < 0.38 else ("droite" if centre_x > 0.62 else "centre")
                                 dist = "proche" if (w / float(w_img)) > 0.25 else "moyen"
                                 position_desc = f"{horiz}, {dist}"
                                 oeil_d_x, oeil_g_x = float(f[4]), float(f[6])
                                 centre_yeux = ((oeil_d_x + oeil_g_x) / 2.0 - x) / max(1.0, float(w))
-                                if 0.32 <= centre_yeux <= 0.68:
+                                if 0.30 <= centre_yeux <= 0.70:
                                     regard_resident = True
                 else:
                     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
@@ -583,7 +631,7 @@ class PerceptionEon:
                     ]
                     if candidats:
                         x, y, w, h = max(candidats, key=lambda r: r[2] * r[3])
-                        roi = gris[y: y + h, x: x + w]
+                        roi = gris[y : y + h, x : x + w]
                         vec_principal = self._extraire_signature_visage_fallback(roi)
                         nom_id, _ = self._identifier_visage(vec_principal)
                         identites.append(nom_id)
@@ -594,7 +642,7 @@ class PerceptionEon:
                 if nb_total_personnes > len(identites):
                     identites.extend(["Inconnu (visage masqué/dos)"] * (nb_total_personnes - len(identites)))
 
-                # 3. Logique de sécurité Résident vs Invité vs Intrus (alignée hors du if)
+                # Logique de sécurité Résident vs Invité vs Intrus
                 profils_valides = self._profils_visages_compatibles()
                 residents_presents = [n for n in identites if not n.startswith("Inconnu") and n != "Non calibré"]
                 inconnus_presents = [n for n in identites if n.startswith("Inconnu")]
@@ -623,7 +671,7 @@ class PerceptionEon:
                     seuil_sec = 1.5 if self.mode_securite == "absent" else 5.0
                     cooldown_ok = (maintenant - self._dernier_check_intrus_ts) >= 600.0
                     if duree_inconnu >= seuil_sec and (
-                            not getattr(self, "_alerte_session_deja_evaluee", False) or cooldown_ok
+                        not getattr(self, "_alerte_session_deja_evaluee", False) or cooldown_ok
                     ):
                         self._dernier_check_intrus_ts = maintenant
                         self._alerte_session_deja_evaluee = True
@@ -669,12 +717,10 @@ class PerceptionEon:
             cap.release()
             panels.log_perception("Caméra arrêtée.")
 
-
-    # ---------------- AUDIO, EMPREINTE VOCALE & WHISPER ----------------
+    # ---------------- AUDIO, ÉCOUTE CONTINUE & WHISPER (0 MO VRAM) ----------------
 
     @staticmethod
     def _extraire_signature_voix(audio: np.ndarray, sr: int = 16000) -> np.ndarray:
-        """Extrait le spectre et le pitch uniquement sur les trames voisées actives."""
         taille_trame = int(sr * 0.025)
         trames_actives = [
             audio[i : i + taille_trame]
@@ -705,13 +751,13 @@ class PerceptionEon:
 
     @staticmethod
     def _contient_energie_vocale(audio: np.ndarray, sr: int = 16000) -> bool:
-        """Filtre rapide (FFT) vérifiant que l'énergie est dans la bande vocale 300-3400 Hz."""
+        """Filtre FFT rapide vérifiant que l'énergie est concentrée dans la bande vocale 300-3400 Hz."""
         spectre = np.abs(np.fft.rfft(audio))
         freqs = np.fft.rfftfreq(len(audio), d=1.0 / sr)
         energie_totale = float(np.sum(spectre**2)) + 1e-9
         masque_voix = (freqs >= 300.0) & (freqs <= 3400.0)
         ratio_voix = float(np.sum(spectre[masque_voix] ** 2)) / energie_totale
-        return ratio_voix >= 0.35
+        return ratio_voix >= 0.38
 
     def _verifier_locuteur(self, audio: np.ndarray) -> tuple[bool, float]:
         if not self._profils_visages_compatibles() or self.profil_voix is None:
@@ -727,21 +773,36 @@ class PerceptionEon:
         vec_voix_actuel = self._extraire_signature_voix(audio)
         sim_voix = _cosinus(self.profil_voix, vec_voix_actuel)
 
-        seuil_visage = 0.37 if self._sface is not None else 0.75
+        seuil_visage = float(self.cfg.get("seuil_visage_sface", 0.46)) if self._sface is not None else 0.78
         if sim_visage >= seuil_visage or sim_voix >= 0.78:
-            if sim_voix >= 0.80:
-                self.profil_voix = 0.9 * self.profil_voix + 0.1 * vec_voix_actuel
+            if sim_voix >= 0.82:
+                self.profil_voix = 0.92 * self.profil_voix + 0.08 * vec_voix_actuel
             return True, round(max(sim_visage, sim_voix), 2)
 
         return False, round(max(sim_visage, sim_voix), 2)
 
     def _charger_whisper(self):
         if self._whisper is None and WhisperModel is not None:
+            # CPU int8 = 0 Mo de VRAM utilisé sur la carte graphique
             taille = self.cfg.get("modele_whisper", "small")
             threads = int(self.cfg.get("whisper_cpu_threads", 6))
-            panels.log_perception(f"Chargement Faster-Whisper ({taille}, CPU int8, {threads} threads)...")
+            panels.log_perception(f"Chargement Faster-Whisper ({taille}, CPU int8, 0 Mo VRAM, {threads} threads)...")
             self._whisper = WhisperModel(taille, device="cpu", compute_type="int8", cpu_threads=threads)
         return self._whisper
+
+    @staticmethod
+    def _journaliser_ecoute_continue(texte: str, statut: str) -> None:
+        if not texte:
+            return
+        try:
+            dossier = BASE_DIR / "captures"
+            dossier.mkdir(parents=True, exist_ok=True)
+            fichier = dossier / f"ecoute_{time.strftime('%Y-%m-%d')}.log"
+            horodatage = time.strftime("%H:%M:%S")
+            with fichier.open("a", encoding="utf-8") as f:
+                f.write(f"[{horodatage}] [{statut}] {texte}\n")
+        except OSError:
+            pass
 
     def _boucle_micro(self) -> None:
         if sd is None or WhisperModel is None:
@@ -756,60 +817,100 @@ class PerceptionEon:
         sr = 16000
         bloc_duree = 0.1
         bloc_taille = int(sr * bloc_duree)
-        seuil_rms = float(self.cfg.get("seuil_micro_rms", 0.035))
+        seuil_rms_min = float(self.cfg.get("seuil_micro_rms", 0.030))
 
+        # Plancher de bruit ambiant adaptatif pour résister au bruit en ville
+        bruit_ambiant_rms = seuil_rms_min * 0.6
         tampon_parole: list[np.ndarray] = []
         pre_buffer: list[np.ndarray] = []
         blocs_silence = 0
+        blocs_barge_in = 0
         en_parole = False
+        a_regarde_pendant_parole = False
 
         def callback_audio(indata, frames, time_info, status):
-            nonlocal en_parole, blocs_silence, tampon_parole, pre_buffer
+            nonlocal en_parole, blocs_silence, blocs_barge_in, tampon_parole, pre_buffer
+            nonlocal bruit_ambiant_rms, a_regarde_pendant_parole
+
             if self.arret_global.is_set():
                 return
 
             morceau = indata[:, 0].copy()
             rms = float(np.sqrt(np.mean(morceau**2)))
-            regarde = self.regarde_ecran_maintenant()
+            regarde = self.regarde_ecran_maintenant(tolerance_sec=2.0)
 
-            if self.ia_en_cours.is_set() and regarde and rms > seuil_rms * 1.5:
-                if len(tampon_parole) >= 6:
-                    self.interruption_event.set()
+            # Seuil dynamique qui s'adapte au bruit de fond (rue, vent, circulation)
+            seuil_dynamique = max(seuil_rms_min, bruit_ambiant_rms * 2.2)
+
+            # Barge-in sécurisé : ne coupe JAMAIS sur un simple bruit de ville
+            if self.ia_en_cours.is_set():
+                seuil_interruption = max(seuil_rms_min * 1.8, bruit_ambiant_rms * 2.8)
+                if regarde and rms > seuil_interruption:
+                    blocs_barge_in += 1
+                    # Nécessite ~0.8s de voix soutenue + spectre vocal + locuteur reconnu
+                    if blocs_barge_in == 8 and len(tampon_parole) >= 7:
+                        extrait_test = np.concatenate(tampon_parole[-8:])
+                        if self._contient_energie_vocale(extrait_test, sr):
+                            if self.profil_voix is None:
+                                self.interruption_event.set()
+                            else:
+                                sim_v = _cosinus(self.profil_voix, self._extraire_signature_voix(extrait_test, sr))
+                                if sim_v >= 0.72:
+                                    self.interruption_event.set()
+                else:
+                    blocs_barge_in = 0
+            else:
+                blocs_barge_in = 0
 
             if not en_parole:
+                # Mise à jour lente du niveau de bruit ambiant quand personne ne parle
+                bruit_ambiant_rms = 0.96 * bruit_ambiant_rms + 0.04 * min(rms, 0.15)
                 pre_buffer.append(morceau)
                 if len(pre_buffer) > 4:
                     pre_buffer.pop(0)
-                if regarde and rms > seuil_rms:
+
+                # On capture TOUTE parole détectée (même sans regard) pour la transcription continue
+                if rms > seuil_dynamique:
                     en_parole = True
                     blocs_silence = 0
+                    a_regarde_pendant_parole = regarde
                     tampon_parole = list(pre_buffer)
             else:
                 tampon_parole.append(morceau)
-                if rms > seuil_rms and regarde:
+                if regarde:
+                    a_regarde_pendant_parole = True
+
+                if rms > seuil_dynamique * 0.85:
                     blocs_silence = 0
                 else:
                     blocs_silence += 1
 
-                if blocs_silence >= 8 or len(tampon_parole) >= 150:
+                if blocs_silence >= 8 or len(tampon_parole) >= 160:
                     audio_complet = np.concatenate(tampon_parole)
+                    regarde_segment = a_regarde_pendant_parole
                     en_parole = False
                     blocs_silence = 0
                     tampon_parole = []
                     pre_buffer = []
+                    a_regarde_pendant_parole = False
 
-                    if len(audio_complet) >= int(sr * 0.8) and self._contient_energie_vocale(audio_complet, sr):
+                    if (
+                        len(audio_complet) >= int(sr * 0.7)
+                        and self._contient_energie_vocale(audio_complet, sr)
+                        and self._transcriptions_en_attente < 2
+                    ):
+                        self._transcriptions_en_attente += 1
                         threading.Thread(
                             target=self._traiter_segment_audio,
-                            args=(audio_complet,),
+                            args=(audio_complet, regarde_segment),
                             daemon=True,
                         ).start()
 
         try:
             with sd.InputStream(samplerate=sr, channels=1, dtype="float32", blocksize=bloc_taille, callback=callback_audio):
                 self.micro_actif = True
-                self.statut_micro = "actif (écoute permanente)"
-                panels.log_perception("Écoute vocale et détection du regard actives.")
+                self.statut_micro = "actif (écoute continue CPU + mot-clé Éon/regard)"
+                panels.log_perception("Écoute continue CPU active (déclenchement par regard ou mot-clé « Éon »).")
                 while not self.arret_global.is_set():
                     time.sleep(0.2)
         except Exception as err:
@@ -817,38 +918,69 @@ class PerceptionEon:
             self.statut_micro = f"erreur ({err})"
             panels.log_perception(f"Erreur flux micro ({err}) -> mode clavier uniquement.")
 
-    def _traiter_segment_audio(self, audio: np.ndarray) -> None:
-        autorise, conf = self._verifier_locuteur(audio)
-        if not autorise:
-            panels.log_perception(f"Parole ignorée : locuteur non reconnu (conf={conf:.2f}).")
-            return
-
+    def _traiter_segment_audio(self, audio: np.ndarray, a_regarde: bool) -> None:
         try:
-            segments, _ = self._whisper.transcribe(
-                audio,
-                language="fr",
-                vad_filter=True,
-                vad_parameters={"min_silence_duration_ms": 400},
-            )
-            morceaux_valides = []
-            prob_silence_min = 1.0
-            for seg in segments:
-                prob_silence_min = min(prob_silence_min, float(getattr(seg, "no_speech_prob", 0.0)))
-                if getattr(seg, "no_speech_prob", 0.0) > 0.45:
-                    continue
-                if getattr(seg, "avg_logprob", 0.0) < -0.75:
-                    continue
-                morceaux_valides.append(seg.text.strip())
-            texte = " ".join(morceaux_valides).strip()
+            with self._lock_whisper:
+                segments, _ = self._whisper.transcribe(
+                    audio,
+                    language="fr",
+                    beam_size=2,
+                    condition_on_previous_text=False,
+                    no_speech_threshold=0.60,
+                    log_prob_threshold=-0.80,
+                    compression_ratio_threshold=2.2,
+                    vad_filter=True,
+                    vad_parameters={
+                        "threshold": 0.58,
+                        "min_speech_duration_ms": 250,
+                        "min_silence_duration_ms": 450,
+                    },
+                )
+                morceaux_valides = []
+                prob_silence_min = 1.0
+                for seg in segments:
+                    prob_silence_min = min(prob_silence_min, float(getattr(seg, "no_speech_prob", 0.0)))
+                    if getattr(seg, "no_speech_prob", 0.0) > 0.50:
+                        continue
+                    if getattr(seg, "avg_logprob", 0.0) < -0.80:
+                        continue
+                    morceaux_valides.append(seg.text.strip())
+                texte = " ".join(morceaux_valides).strip()
         except Exception as err:
             panels.log_perception(f"Erreur transcription : {err}")
             return
+        finally:
+            self._transcriptions_en_attente = max(0, self._transcriptions_en_attente - 1)
 
-        bruits_parasites = {"sous-titres réalisés par la communauté d'amara.org", "merci.", "merci"}
-        if len(texte) < 3 or texte.lower() in bruits_parasites:
+        if len(texte) < 3 or texte.lower().strip(" !?.,") in BRUITS_PARASITES_WHISPER:
             return
 
-        if (not self._profils_visages_compatibles() or self.profil_voix is None) and len(audio) >= int(16000 * 1.2) and prob_silence_min < 0.30:
+        # Vérifie si le mot-clé "Éon" a été prononcé ou si l'utilisateur regardait l'écran
+        contient_eon = bool(REGEX_WAKE_WORD.search(texte))
+        doit_repondre = a_regarde or contient_eon
+
+        if not doit_repondre:
+            panels.log_perception(f"[ENTENDU - passif] {texte}")
+            self._journaliser_ecoute_continue(texte, "passif")
+            return
+
+        # Si l'utilisateur a dit "Éon" pendant que l'IA parlait, on l'interrompt proprement
+        if self.ia_en_cours.is_set() and contient_eon:
+            self.interruption_event.set()
+
+        autorise, conf = self._verifier_locuteur(audio)
+        if not autorise and not contient_eon:
+            panels.log_perception(f"[ENTENDU - locuteur inconnu conf={conf:.2f}] {texte}")
+            self._journaliser_ecoute_continue(texte, f"ignore_locuteur:{conf:.2f}")
+            return
+
+        # Calibration initiale prudente uniquement si regard actif et audio propre
+        if (
+            a_regarde
+            and (not self._profils_visages_compatibles() or self.profil_voix is None)
+            and len(audio) >= int(16000 * 1.4)
+            and prob_silence_min < 0.25
+        ):
             with self._lock_vision:
                 vec_v = self._dernier_vecteur_visage.copy() if self._dernier_vecteur_visage is not None else None
             if vec_v is not None:
@@ -857,8 +989,10 @@ class PerceptionEon:
                 self._sauvegarder_profil()
                 panels.log_perception("Profil biométrique initial calibré (Bryan).")
 
+        motif_declenchement = "mot-clé Éon" if contient_eon and not a_regarde else ("regard+Éon" if contient_eon else "regard")
         self.pret_pour_saisie.clear()
-        panels.log_perception(f"[VOIX conf={conf:.2f}] {texte}")
+        panels.log_perception(f"[VOIX -> EON | {motif_declenchement} | conf={conf:.2f}] {texte}")
+        self._journaliser_ecoute_continue(texte, f"actif:{motif_declenchement}")
         panels.ecrire_chat(f"\nVous (voix) : {texte}")
         self.file_messages.put(MessageEntrant(texte=texte, source="voix", confiance_locuteur=conf))
 

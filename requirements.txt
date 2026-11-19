@@ -4,3 +4,6 @@ numpy
 ollama
 opencv-python
 sounddevice
+
+contextvars
+textual
