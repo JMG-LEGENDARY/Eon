@@ -4,15 +4,17 @@
   "shell_mode": "ask",
   "modele_optimiseur": "qwen2.5:7B",
   "route_defaut": "qwen2.5:7B",
-  "regles_apprises": [],
+  "regles_apprises": [
+    "ajouter un contexte pour les modifications de code source"
+  ],
   "routage": {
     "utiliser_embeddings": true,
     "embed_model": "bge-m3",
     "seuils": {
       "confiance": 0.54,
       "marge": 0.03,
-      "insatisfaction": 0.62,
-      "confiance_directe": 0.63,
+      "insatisfaction": 0.675,
+      "confiance_directe": 0.625,
       "marge_directe": 0.05,
       "intention_outil": 0.58
     },
@@ -190,7 +192,7 @@
       "expertise": "Refactoring complexe multi-fichiers, architecture logicielle lourde et debugging bas niveau (plus lent, sollicite le CPU).",
       "temperature": 0.15,
       "num_ctx": 4096,
-      "num_predict": 1536,
+      "num_predict": 1280,
       "web_tools": true,
       "file_tools": true,
       "shell_tools": true,

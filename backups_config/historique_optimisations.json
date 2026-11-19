@@ -19,6 +19,36 @@
         "`num_predict` `qwen2.5-coder:14B` : 1536 -> 1280",
         "Seuil `confiance_directe` : 0.630 -> 0.625 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]"
       ]
+    },
+    {
+      "date": "2026-11-19T20:39:54",
+      "backup": "backups_config/config_ia_20261119_203436.json",
+      "duree_min": 5.3,
+      "resume_court": "12 échec(s) analysé(s), 22 ajustement(s) validé(s), mémoire +1 épisode(s) / +3 fait(s) en 5.3 min.",
+      "actions_cles": [
+        "Dataset [intentions.web_obligatoire] + « demander des informations sur les jeux vidéo populaires en ce moment » (validée (sim_cible=0.70, plus proche='vision_camera' à 0.59))",
+        "Seuil `confiance_directe` : 0.625 -> 0.615 [progression contrôlée (pas max 0.010) | backtest validé (score 30 -> 30, échecs interceptés 28 -> 27)]",
+        "Dataset [intentions.web_obligatoire] + « aller sur internet pour une recherche générale » (validée (sim_cible=0.66, plus proche='vision_camera' à 0.54))",
+        "Seuil `confiance_directe` : 0.615 -> 0.620 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 30 -> 30, échecs interceptés 27 -> 27)]",
+        "Dataset [intentions.web_obligatoire] + « demander un club actuel d'un sportif » (validée (sim_cible=0.87, plus proche='vision_camera' à 0.60))",
+        "Dataset [intentions.web_obligatoire] + « demander des informations techniques ou des données spécifiques » (validée (sim_cible=0.83, plus proche='export_historique' à 0.66))",
+        "Seuil `confiance_directe` : 0.620 -> 0.630 [progression contrôlée (pas max 0.010) | backtest validé (score 30 -> 30, échecs interceptés 27 -> 28)]",
+        "Dataset [routes.general_et_web] + « demander des actualités ou des nouvelles en temps réel » (validée (sim_cible=0.89, plus proche='creatif_discussion' à 0.70))",
+        "Règle ajoutée : « prioriser les sources d'actualités fiables »",
+        "Dataset [routes.general_et_web] + « demander des informations sur les produits technologiques récents » (validée (sim_cible=0.81, plus proche='vision_multimodale' à 0.67))",
+        "Seuil `insatisfaction` : 0.675 -> 0.663 [dichotomie après inversion (pas réduit à 0.013) | validation directe (paramètre hors matrice de marge)]",
+        "Règle ajoutée : « prioriser les sources d'informations les plus récentes »",
+        "Dataset [routes.general_et_web] + « demander des informations vérifiables sur le web » (validée (sim_cible=0.85, plus proche='code_courant' à 0.68))",
+        "Seuil `confiance_directe` : 0.630 -> 0.625 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 28 -> 28, échecs interceptés 27 -> 27)]",
+        "Dataset [routes.general_et_web] + « demander des informations techniques ou des produits électroniques » (validée (sim_cible=0.88, plus proche='vision_multimodale' à 0.72))",
+        "Dataset [intentions.web_obligatoire] + « demander une copie d'un fichier ou d'un dossier » (validée (sim_cible=0.72, plus proche='export_historique' à 0.83))",
+        "Seuil `confiance_directe` : 0.625 -> 0.630 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 28 -> 28, échecs interceptés 27 -> 27)]",
+        "Dataset [intentions.web_obligatoire] + « demander des instructions pour trouver un fichier spécifique à l'aide de commandes Linux » (validée (sim_cible=0.70, plus proche='export_historique' à 0.62))",
+        "Seuil `insatisfaction` : 0.663 -> 0.669 [dichotomie après inversion (pas réduit à 0.006) | validation directe (paramètre hors matrice de marge)]",
+        "Température `qwen2.5-coder:7B` : 0.15 -> 0.27 [exploration initiale bornée (pas max 0.120)]",
+        "`num_predict` `qwen2.5-coder:7B` : 1024 -> 768",
+        "Dataset [routes.general_et_web] + « répondre directement à des questions techniques sans explications détaillées » (validée (sim_cible=0.64, plus proche='phatique' à 0.68))"
+      ]
     }
   ],
   "trajectoires_parametres": {
@@ -26,28 +56,30 @@
       "valeurs": [
         0.62,
         0.65,
-        0.675
+        0.675,
+        0.663,
+        0.669
       ],
-      "dernier_pas": 0.025,
-      "inversions": 0
+      "dernier_pas": 0.006,
+      "inversions": 2
     },
     "routage.seuils.confiance_directe": {
       "valeurs": [
-        0.6,
-        0.605,
-        0.642,
+        0.64,
         0.64,
         0.625,
+        0.615,
+        0.62,
         0.63,
-        0.64,
+        0.635,
         0.625,
+        0.615,
         0.63,
         0.64,
-        0.64,
-        0.625
+        0.64
       ],
-      "dernier_pas": -0.005,
-      "inversions": 6
+      "dernier_pas": 0.01,
+      "inversions": 9
     },
     "routes.qwen2.5:7B.temperature": {
       "valeurs": [
@@ -61,6 +93,14 @@
         0.15
       ],
       "dernier_pas": 0.0,
+      "inversions": 0
+    },
+    "routes.qwen2.5-coder:7B.temperature": {
+      "valeurs": [
+        0.15,
+        0.27
+      ],
+      "dernier_pas": 0.12,
       "inversions": 0
     }
   }

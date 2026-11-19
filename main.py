@@ -287,11 +287,13 @@ class ApplicationEon:
             msg_user["images"] = images
         messages.append(msg_user)
 
-        options_ollama = {
+        options_ollama: dict[str, Any] = {
             "temperature": float(route_cfg.get("temperature") if route_cfg.get("temperature") is not None else 0.2),
             "num_ctx": int(route_cfg.get("num_ctx") or 4096),
             "num_predict": int(route_cfg.get("num_predict") or 768),
         }
+        if route_cfg.get("num_gpu") is not None:
+            options_ollama["num_gpu"] = int(route_cfg["num_gpu"])
 
         keep_alive = "30s" if ("12b" in modele.lower() or "14b" in modele.lower()) else "5m"
 

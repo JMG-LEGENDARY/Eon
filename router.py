@@ -667,7 +667,17 @@ class RouteurAutonome:
         routage_cfg = self.config.get("routage", {})
         seuils = routage_cfg.get("seuils", {})
         embed_model = routage_cfg.get("embed_model", "bge-m3")
-
+        # Détection directe des salutations/acquittements sur le message brut (évite la pollution par le contexte)
+        msg_brut = re.sub(r"(.)\1{2,}", r"\1\1", message.strip())  # Normalise "saaaallluuuttt" -> "saalluutt"
+        if len(msg_brut.split()) <= 5 and "phatique" in self.embeddings_roles:
+            vec_brut = _embed_texte_cache(embed_model, msg_brut)
+            scores_bruts = sorted(
+                ((r, self._score_top_k(vec_brut, v, k=2)) for r, v in self.embeddings_roles.items()),
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            if scores_bruts and scores_bruts[0][0] == "phatique" and scores_bruts[0][1] >= 0.60:
+                return self.modele_par_role("phatique"), scores_bruts[0][1], "sémantique:phatique_direct"
         requete_ctx = self._construire_requete_contextualisee(message, dernier_prompt, derniere_reponse)
         vec_ctx = _embed_texte_cache(embed_model, requete_ctx)
 

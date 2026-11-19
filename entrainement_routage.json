@@ -2,10 +2,12 @@
   "routes": {
     "phatique": [
       "saluer quelqu'un de manière brève et informelle",
-      "dire bonjour, bonsoir ou coucou",
-      "remercier brièvement pour une réponse",
-      "acquiescer simplement sans poser de nouvelle question",
-      "prendre congé ou dire au revoir"
+      "remercier brièvement ou acquiescer sans poser de nouvelle question",
+      "salut bonjour bonsoir coucou hello yo",
+      "salut ça va comment tu vas",
+      "merci beaucoup c'est parfait nickel super",
+      "ok d'accord entendu ça marche",
+      "au revoir à plus tard bonne soirée"
     ],
     "vision_multimodale": [
       "demander ce que la caméra ou la webcam voit en ce moment",
@@ -25,7 +27,12 @@
       "explique moi théoriquement comment ça fonctionne",
       "donne moi une définition simple et claire",
       "résume moi ce sujet en quelques points clés",
-      "expliquer un concept technique ou un langage de programmation"
+      "expliquer un concept technique ou un langage de programmation",
+      "demander des actualités ou des nouvelles en temps réel",
+      "demander des informations sur les produits technologiques récents",
+      "demander des informations vérifiables sur le web",
+      "demander des informations techniques ou des produits électroniques",
+      "répondre directement à des questions techniques sans explications détaillées"
     ],
     "code_courant": [
       "demander d'exécuter une action ou une commande sur le système Linux",
@@ -68,7 +75,13 @@
       "demander le club actuel, le poste ou la situation présente d'une personne",
       "demander de vérifier des faits récents sur des sources externes",
       "contester une information datée et exiger une vérification à jour",
-      "afficher l'historique de la conversation"
+      "afficher l'historique de la conversation",
+      "demander des informations sur les jeux vidéo populaires en ce moment",
+      "aller sur internet pour une recherche générale",
+      "demander un club actuel d'un sportif",
+      "demander des informations techniques ou des données spécifiques",
+      "demander une copie d'un fichier ou d'un dossier",
+      "demander des instructions pour trouver un fichier spécifique à l'aide de commandes Linux"
     ],
     "vision_camera": [
       "demander ce qui est visible devant la caméra",

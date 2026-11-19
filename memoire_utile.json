@@ -1,11 +1,17 @@
 {
   "identite": {
     "valeur": "Bryan",
-    "maj": "2026-11-18T23:14:30"
+    "maj": "2026-11-19T20:39:51"
   },
   "localisation": {},
-  "preferences": {},
-  "materiel_projets": {},
+  "preferences": {
+    "valeur": "Besoin d'aide pour des préoccupations liées au travail",
+    "maj": "2026-11-19T20:39:51"
+  },
+  "materiel_projets": {
+    "valeur": "Modèle 1b non appelé",
+    "maj": "2026-11-19T20:39:51"
+  },
   "quotidien": {},
   "os_version": {
     "valeur": "Fedora",
