@@ -1,0 +1,113 @@
+{
+  "routes": {
+    "phatique": [
+      "saluer quelqu'un de manière brève et informelle",
+      "dire bonjour, bonsoir ou coucou",
+      "remercier brièvement pour une réponse",
+      "acquiescer simplement sans poser de nouvelle question",
+      "prendre congé ou dire au revoir"
+    ],
+    "vision_multimodale": [
+      "demander ce que la caméra ou la webcam voit en ce moment",
+      "demander de décrire la scène, les personnes ou les objets devant l'écran",
+      "demander la couleur d'un vêtement ou un détail physique visible",
+      "demander de lire un texte ou un objet montré à la caméra",
+      "vérifier si les capteurs visuels perçoivent quelque chose"
+    ],
+    "general_et_web": [
+      "poser une question de culture générale ou demander une explication théorique",
+      "demander les actualités récentes ou ce qu'il se passe en ce moment",
+      "demander quel est le dernier modèle sorti d'un produit ou d'une technologie",
+      "demander où joue un sportif ou quelle est la situation actuelle d'une personnalité",
+      "demander de vérifier une information factuelle et datée sur des sources fiables",
+      "demander ce que l'assistant sait sur l'utilisateur",
+      "qu'est-ce que tu sais sur moi quelles infos tu as",
+      "explique moi théoriquement comment ça fonctionne",
+      "donne moi une définition simple et claire",
+      "résume moi ce sujet en quelques points clés"
+    ],
+    "code_courant": [
+      "demander d'exécuter une action ou une commande sur le système Linux",
+      "demander de lire, créer, modifier ou copier un fichier sur le disque",
+      "demander d'écrire ou corriger un script Python, Rust, C ou Bash",
+      "demander de diagnostiquer une erreur système, un paquet ou un service",
+      "demander de vérifier le contenu d'un fichier qui vient d'être créé",
+      "exécute cette commande dans le terminal",
+      "mets à jour mon système fedora avec dnf",
+      "lis ce fichier python et modifie-le pour corriger le bug"
+    ],
+    "architecture_lourde": [
+      "concevoir l'architecture complète d'une application complexe",
+      "refactoriser un projet entier sur plusieurs fichiers",
+      "résoudre un problème avancé de concurrence, multithreading ou performance bas niveau",
+      "auditer en profondeur la structure logicielle d'un système distribué",
+      "refactore entièrement mon projet vers une architecture propre",
+      "conçois l'architecture complète d'un système distribué"
+    ],
+    "creatif_discussion": [
+      "discuter librement de tout et de rien sur un ton détendu et humain",
+      "demander une blague, une anecdote ou une histoire immersive",
+      "faire du brainstorming ouvert sans contrainte technique",
+      "demander un avis personnel ou philosophique sur un sujet",
+      "on discute un peu de tout et de rien",
+      "destresse un peu soit plus humain et naturel",
+      "raconte moi une histoire immersive",
+      "tu penses quoi de tout ça donne moi ton avis",
+      "fais moi une blague ou un truc drôle"
+    ],
+    "contexte_complexe": [
+      "reformule ce texte brouillon en un prompt clair et structuré",
+      "prends ce pavé mal structuré et extrais ce que je cherche"
+    ]
+  },
+  "intentions": {
+    "web_obligatoire": [
+      "demander des informations récentes ou d'actualité",
+      "demander le dernier modèle ou la dernière version sortie d'un appareil",
+      "demander le club actuel, le poste ou la situation présente d'une personne",
+      "demander de vérifier des faits récents sur des sources externes",
+      "contester une information datée et exiger une vérification à jour"
+    ],
+    "vision_camera": [
+      "demander ce qui est visible devant la caméra",
+      "demander de décrire les personnes ou objets présents dans la pièce",
+      "accepter une proposition de description visuelle de la scène"
+    ],
+    "export_historique": [
+      "demander une copie ou une sauvegarde de la conversation dans un fichier",
+      "exporter l'historique des échanges vers un dossier personnel"
+    ],
+    "purge_contexte": [
+      "demander d'oublier la conversation précédente et de repartir de zéro",
+      "ignorer les réponses précédentes qui contenaient des erreurs"
+    ],
+    "insatisfaction": [
+      "dire que le modèle choisi n'est pas le bon",
+      "dire que la réponse est fausse, obsolète ou hors sujet",
+      "reprocher à l'assistant de répéter la même chose sans vérifier",
+      "signaler que le contenu d'un fichier ou d'une réponse est absurde ou vide",
+      "non pas du tout c'est n'importe quoi",
+      "tu es complètement à côté de la plaque",
+      "tu racontes vraiment n'importe quoi",
+      "ce n'est pas le bon modèle tu te trompes",
+      "tu ne réponds pas à ma question",
+      "arrête de parler comme un robot tu es lourd",
+      "tu comprends rien à ce que je dis",
+      "c'est faux et hors sujet",
+      "tu es en totale hallucination",
+      "pfff laisse tomber t'es nul"
+    ]
+  },
+  "consentement": {
+    "oui": [
+      "accepter et donner son accord pour exécuter l'action",
+      "dire oui, d'accord, vas-y ou fais-le",
+      "confirmer et autoriser l'opération demandée"
+    ],
+    "non": [
+      "refuser et annuler l'action proposée",
+      "dire non, laisse tomber ou ne le fais pas",
+      "interdire l'exécution de l'opération"
+    ]
+  }
+}

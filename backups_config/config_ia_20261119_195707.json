@@ -1,0 +1,218 @@
+{
+  "web_mode": "ask",
+  "file_mode": "ask",
+  "shell_mode": "ask",
+  "modele_optimiseur": "qwen2.5:7B",
+  "route_defaut": "qwen2.5:7B",
+  "regles_apprises": [],
+  "routage": {
+    "utiliser_embeddings": true,
+    "embed_model": "bge-m3",
+    "seuils": {
+      "confiance": 0.54,
+      "marge": 0.03,
+      "insatisfaction": 0.62,
+      "confiance_directe": 0.63,
+      "marge_directe": 0.05,
+      "intention_outil": 0.58
+    },
+    "mots_cles_lourds": [
+      "architecture",
+      "microservice",
+      "deadlock",
+      "race condition",
+      "concurrence",
+      "multithread",
+      "refactore",
+      "refactor",
+      "distribué",
+      "scalab"
+    ],
+    "regles_regex": [
+      {
+        "nom": "phatique",
+        "cible_role": "phatique",
+        "confiance": 1.0,
+        "dedupliquer_lettres": true,
+        "pattern": "^(salut|slut|slt|bonjour|bjr|bonsoir|coucou|cc|helo|hi|hey|yo)(\\s+(ma\\s+go|mec|gros|frero|frérot|toi|la\\s+team|tout\\s+le\\s+monde|ca\\s+va|ça\\s+va))?[!?.…\\s]*$\u000bert{}^(merci(\\s+beaucoup)?\u000bert{}ok(ay)?\u000bert{}dacord\u000bert{}d'accord\u000bert{}parfait\u000bert{}super\u000bert{}genial\u000bert{}génial\u000bert{}nickel\u000bert{}au\\s+revoir\u000bert{}a\\s+plus\u000bert{}à\\s+plus\u000bert{}bye)[!?.…\\s]*$"
+      },
+      {
+        "nom": "code_ou_systeme",
+        "cible_role": "code_courant",
+        "cible_role_lourd": "architecture_lourde",
+        "confiance": 0.95,
+        "pattern": "(```|Traceback|\\b[\\w./-]+\\.(py|rs|c|cpp|h|js|ts|sh|json|jsonl|toml|lua|html|css|sql|md|txt|log)\\b|\\b(fichier|fichiers|dossier|dossiers|répertoire|arborescence|script|code\\s+source|terminal|bash|shell|commande|ex[ée]cute|lance|pwd|ls|cat|grep|git|nvidia-smi|systemctl|journalctl|os-release|machine|dnf|rpm|flatpak|sudo|paquets?|syst[èe]me|\\bsys\\b|zenity|notify-send|fen[êe]tre|mettre\\s+[àa]\\s+j(ou)?r|mise\\s+[àa]\\s+j(ou)?r|\\bmaj\\b|update|upgrade)\\b)"
+      },
+      {
+        "nom": "web_ou_actualite",
+        "cible_role": "general_et_web",
+        "confiance": 0.9,
+        "pattern": "\\b(internet|web|en\\s+ligne|actualit[ée]s?|news|m[ée]t[ée]o|aujourd'?hui|hier|cette\\s+semaine|derni[èe]re?\\s+(vid[ée]o|version|sortie|album)|prix|cours|2025|2026|cherche|recherche|google|youtube)\\b"
+      }
+    ],
+    "pattern_continuation_action": "^(fais[- ]le|fais[- ]la|ex[ée]cute([- ]le|-la)?|lance([- ]le|-la)?|vas[- ]y|essaie|teste|appliques?[- ]le)[!?.…\\s]*$",
+    "pattern_rupture_relance": "^(lis|lire|affiche|montre|liste|cherche|modifie|crée|ex[ée]cute|lance|quel\\s+mod[èe]le|quelle\\s+ia|qui\\s+peut|qu'est-ce\\s+que\\s+tu\\s+peux)\\b",
+    "superviseur_model": "qwen3:0.6b",
+    "utiliser_superviseur_ia": true
+  },
+  "signaux": {
+    "consentement_oui": [
+      "oui",
+      "ouais",
+      "yep",
+      "yes",
+      "ok",
+      "okay",
+      "d'accord",
+      "dac",
+      "vas-y",
+      "fonce",
+      "allez",
+      "carrément",
+      "pourquoi pas",
+      "si tu veux",
+      "volontiers",
+      "avec plaisir",
+      "fais-le",
+      "cherche",
+      "go",
+      "bien sûr",
+      "évidemment",
+      "c'est bon",
+      "je veux bien",
+      "autorise",
+      "tu peux",
+      "grave"
+    ],
+    "consentement_non": [
+      "non",
+      "nan",
+      "nope",
+      "no",
+      "pas besoin",
+      "laisse tomber",
+      "t'embête pas",
+      "ne cherche pas",
+      "n'y va pas",
+      "refuse",
+      "interdit",
+      "stop",
+      "annule",
+      "pas la peine",
+      "inutile",
+      "bof",
+      "non merci",
+      "je ne veux pas",
+      "reste hors ligne",
+      "tant pis",
+      "oublie"
+    ],
+    "insatisfaction": [
+      "non pas du tout c'est n'importe quoi",
+      "tu es complètement à côté de la plaque",
+      "tu racontes vraiment n'importe quoi",
+      "ce n'est pas le bon modèle tu te trompes",
+      "tu ne réponds pas à ma question",
+      "arrête de parler comme un robot tu es lourd",
+      "tu comprends rien à ce que je dis",
+      "c'est faux et hors sujet",
+      "tu es en totale hallucination",
+      "pfff laisse tomber t'es nul"
+    ]
+  },
+  "routes": {
+    "gemma3:1b": {
+      "alias": "1b",
+      "role": "phatique",
+      "expertise": "Salutations courtes et accusés de réception.",
+      "temperature": 0.6,
+      "num_ctx": 2048,
+      "num_predict": 60,
+      "web_tools": false,
+      "file_tools": false,
+      "shell_tools": false,
+      "examples": []
+    },
+    "huihui_ai/qwen3-abliterated:8b": {
+      "alias": "c",
+      "role": "creatif_discussion",
+      "expertise": "Discussion libre, humour, brainstorming, ton naturel sans filtre ni rigidité.",
+      "temperature": 0.8,
+      "num_ctx": 4096,
+      "num_predict": 512,
+      "web_tools": true,
+      "file_tools": false,
+      "shell_tools": false,
+      "examples": [
+        "on discute un peu de tout et de rien",
+        "destresse un peu soit plus humain et naturel",
+        "raconte moi une histoire immersive",
+        "tu penses quoi de tout ça donne moi ton avis",
+        "fais moi une blague ou un truc drôle"
+      ]
+    },
+    "qwen2.5:7B": {
+      "alias": "g",
+      "role": "general_et_web",
+      "expertise": "Culture générale, explications théoriques, synthèse, recherche Internet et mémoire utilisateur.",
+      "temperature": 0.25,
+      "num_ctx": 8192,
+      "num_predict": 768,
+      "web_tools": true,
+      "file_tools": false,
+      "shell_tools": false,
+      "examples": [
+        "qu'est-ce que tu sais sur moi quelles infos tu as",
+        "explique moi théoriquement comment ça fonctionne",
+        "donne moi une définition simple et claire",
+        "résume moi ce sujet en quelques points clés"
+      ]
+    },
+    "qwen2.5-coder:7B": {
+      "alias": "code",
+      "role": "code_courant",
+      "expertise": "Administration système Linux/Fedora, commandes terminal bash, lecture/édition de fichiers locaux, scripts Python/Rust/C.",
+      "temperature": 0.15,
+      "num_ctx": 8192,
+      "num_predict": 1024,
+      "web_tools": true,
+      "file_tools": true,
+      "shell_tools": true,
+      "examples": [
+        "exécute cette commande dans le terminal",
+        "mets à jour mon système fedora avec dnf",
+        "lis ce fichier python et modifie-le pour corriger le bug"
+      ]
+    },
+    "qwen2.5-coder:14B": {
+      "alias": "code+",
+      "role": "architecture_lourde",
+      "expertise": "Refactoring complexe multi-fichiers, architecture logicielle lourde et debugging bas niveau (plus lent, sollicite le CPU).",
+      "temperature": 0.15,
+      "num_ctx": 4096,
+      "num_predict": 1536,
+      "web_tools": true,
+      "file_tools": true,
+      "shell_tools": true,
+      "examples": [
+        "refactore entièrement mon projet vers une architecture propre",
+        "conçois l'architecture complète d'un système distribué"
+      ]
+    },
+    "gemma3:12b-it-qat": {
+      "alias": "12b",
+      "role": "contexte_complexe",
+      "expertise": "Reformulation de textes brouillons, extraction d'intentions complexes ou dictées vocales mal structurées.",
+      "temperature": 0.3,
+      "num_ctx": 4096,
+      "num_predict": 512,
+      "web_tools": true,
+      "file_tools": false,
+      "shell_tools": false,
+      "examples": [
+        "reformule ce texte brouillon en un prompt clair et structuré",
+        "prends ce pavé mal structuré et extrais ce que je cherche"
+      ]
+    }
+  }
+}

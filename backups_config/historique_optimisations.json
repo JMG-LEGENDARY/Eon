@@ -1,0 +1,67 @@
+{
+  "sessions": [
+    {
+      "date": "2026-11-19T20:04:30",
+      "backup": "backups_config/config_ia_20261119_195707.json",
+      "duree_min": 7.39,
+      "resume_court": "22 échec(s) analysé(s), 12 ajustement(s) validé(s), mémoire +1 épisode(s) / +4 fait(s) en 7.4 min.",
+      "actions_cles": [
+        "Dataset [intentions.web_obligatoire] + « afficher l'historique de la conversation » (validée (sim_cible=0.61, plus proche='export_historique' à 0.71))",
+        "Seuil `insatisfaction` : 0.620 -> 0.650 [exploration initiale bornée (pas max 0.050) | validation directe (paramètre hors matrice de marge)]",
+        "Seuil `confiance_directe` : 0.630 -> 0.625 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]",
+        "Dataset [routes.general_et_web] + « expliquer un concept technique ou un langage de programmation » (validée (sim_cible=0.60, plus proche='architecture_lourde' à 0.60))",
+        "Seuil `confiance_directe` : 0.625 -> 0.630 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]",
+        "Règle ajoutée : « ajouter un contexte pour les modifications de code source »",
+        "Seuil `confiance_directe` : 0.630 -> 0.625 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]",
+        "Seuil `confiance_directe` : 0.625 -> 0.630 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]",
+        "Dataset [intentions.insatisfaction] + « rétablir la connexion ou la session » (validée (sim_cible=0.53, plus proche='purge_contexte' à 0.66))",
+        "Seuil `insatisfaction` : 0.650 -> 0.675 [progression contrôlée (pas max 0.025) | validation directe (paramètre hors matrice de marge)]",
+        "`num_predict` `qwen2.5-coder:14B` : 1536 -> 1280",
+        "Seuil `confiance_directe` : 0.630 -> 0.625 [dichotomie après inversion (pas réduit à 0.005) | backtest validé (score 39 -> 39, échecs interceptés 22 -> 22)]"
+      ]
+    }
+  ],
+  "trajectoires_parametres": {
+    "routage.seuils.insatisfaction": {
+      "valeurs": [
+        0.62,
+        0.65,
+        0.675
+      ],
+      "dernier_pas": 0.025,
+      "inversions": 0
+    },
+    "routage.seuils.confiance_directe": {
+      "valeurs": [
+        0.6,
+        0.605,
+        0.642,
+        0.64,
+        0.625,
+        0.63,
+        0.64,
+        0.625,
+        0.63,
+        0.64,
+        0.64,
+        0.625
+      ],
+      "dernier_pas": -0.005,
+      "inversions": 6
+    },
+    "routes.qwen2.5:7B.temperature": {
+      "valeurs": [
+        0.25
+      ],
+      "dernier_pas": 0.0,
+      "inversions": 0
+    },
+    "routes.qwen2.5-coder:14B.temperature": {
+      "valeurs": [
+        0.15
+      ],
+      "dernier_pas": 0.0,
+      "inversions": 0
+    }
+  }
+}
