@@ -126,6 +126,7 @@ CONFIG_DEFAUT: dict = {
         "gemma3:1b": {
             "alias": "1b",
             "role": "phatique",
+            "supports_tools": False,
             "expertise": "Salutations courtes et accusés de réception.",
             "temperature": 0.6,
             "num_ctx": 1024,
@@ -336,7 +337,6 @@ class RouteurAutonome:
         return [list(_normaliser_l2(v)) for v in vecs]
 
     def charger(self, silencieux: bool = False) -> None:
-        # 1. Chargement et normalisation de config_ia.json
         if not CONFIG_FILE.exists() or CONFIG_FILE.stat().st_size == 0:
             nouvelle_cfg = self._restaurer_ou_generer_config() if not self.config else self.config
         else:
@@ -354,7 +354,6 @@ class RouteurAutonome:
         else:
             self._config_mtime = CONFIG_FILE.stat().st_mtime
 
-        # 2. Chargement ou création automatique du fichier externe entrainement_routage.json
         dataset_modifie = False
         if not TRAINING_FILE.exists() or TRAINING_FILE.stat().st_size == 0:
             self.dataset = copy.deepcopy(ENTRAINEMENT_DEFAUT)
@@ -375,7 +374,6 @@ class RouteurAutonome:
                     sec_dict[cle] = list(phrases)
                     dataset_modifie = True
 
-        # Migration ascendante : récupère d'éventuelles phrases ajoutées dans config_ia.json
         for modele, r_cfg in self.config.get("routes", {}).items():
             role = r_cfg.get("role", "")
             anciens_ex = r_cfg.get("examples", [])
@@ -399,7 +397,6 @@ class RouteurAutonome:
         elif TRAINING_FILE.exists():
             self._training_mtime = TRAINING_FILE.stat().st_mtime
 
-        # 3. Vectorisation CPU (0 Mo VRAM) avec cache disque par signature SHA-256
         routage_cfg = self.config.get("routage", {})
         if not routage_cfg.get("utiliser_embeddings", True):
             self.embeddings_roles = {}
@@ -482,7 +479,7 @@ class RouteurAutonome:
         max_tokens: int = 60,
         format_json: bool = False,
     ) -> str:
-        """Exécute le mini-modèle superviseur sur CPU (0 Mo VRAM, déjà résident en RAM avec context_compressor)."""
+        """Exécute le mini-modèle superviseur sur CPU (0 Mo VRAM)."""
         superviseur = self.config.get("routage", {}).get("superviseur_model", "qwen3:0.6b")
         kwargs: dict = {
             "model": superviseur,
@@ -505,6 +502,51 @@ class RouteurAutonome:
         if "</think>" in contenu:
             contenu = contenu.split("</think>", 1)[1].strip()
         return contenu
+
+    def normaliser_intention_vocale(
+        self,
+        texte_voix: str,
+        dernier_prompt: str = "",
+        derniere_reponse: str = "",
+    ) -> str:
+        """Corrige les homophones et déformations phonétiques Whisper avant routage ou recherche Web."""
+        brut = texte_voix.strip()
+        if not brut or len(brut.split()) <= 2:
+            return brut
+        if not self.config.get("routage", {}).get("utiliser_superviseur_ia", True):
+            return brut
+
+        prompt_sys = (
+            "Tu es un correcteur orthographique et phonétique pour reconnaissance vocale française (Whisper). "
+            "Corrige UNIQUEMENT les fautes d'homophones, noms propres ou termes techniques mal transcrits "
+            "(ex: 'un test' transcrit 'arfest', 'docker' transcrit 'doquer', 'python' transcrit 'piton'). "
+            "RÈGLES STRICTES : "
+            "1. Ne réponds JAMAIS à la question. "
+            "2. Ne change pas le sens ni la structure de la demande. "
+            "3. Si la phrase est déjà compréhensible, renvoie-la exactement à l'identique. "
+            "4. Renvoie UNIQUEMENT la phrase corrigée sur une seule ligne, sans guillemets ni commentaire."
+        )
+        contexte = ""
+        if dernier_prompt:
+            contexte += f"Contexte récent utilisateur : {dernier_prompt[:120]}\n"
+        if derniere_reponse:
+            contexte += f"Contexte récent assistant : {derniere_reponse[:140]}\n"
+        prompt_usr = f"{contexte}Transcription vocale brute : {brut}"
+
+        try:
+            corrige = self._appeler_superviseur_cpu(prompt_sys, prompt_usr, max_tokens=90, format_json=False)
+            corrige = corrige.strip().strip("\"'")
+            # Garde-fou contre toute dérive du mini-modèle
+            if (
+                not corrige
+                or "\n" in corrige
+                or len(corrige) > int(len(brut) * 1.6) + 25
+                or corrige.lower().startswith(("bonjour", "je ", "voici", "bien sûr"))
+            ):
+                return brut
+            return corrige
+        except Exception:
+            return brut
 
     def _construire_requete_contextualisee(
         self,
@@ -667,8 +709,8 @@ class RouteurAutonome:
         routage_cfg = self.config.get("routage", {})
         seuils = routage_cfg.get("seuils", {})
         embed_model = routage_cfg.get("embed_model", "bge-m3")
-        # Détection directe des salutations/acquittements sur le message brut (évite la pollution par le contexte)
-        msg_brut = re.sub(r"(.)\1{2,}", r"\1\1", message.strip())  # Normalise "saaaallluuuttt" -> "saalluutt"
+
+        msg_brut = re.sub(r"(.)\1{2,}", r"\1\1", message.strip())
         if len(msg_brut.split()) <= 5 and "phatique" in self.embeddings_roles:
             vec_brut = _embed_texte_cache(embed_model, msg_brut)
             scores_bruts = sorted(
@@ -678,6 +720,7 @@ class RouteurAutonome:
             )
             if scores_bruts and scores_bruts[0][0] == "phatique" and scores_bruts[0][1] >= 0.60:
                 return self.modele_par_role("phatique"), scores_bruts[0][1], "sémantique:phatique_direct"
+
         requete_ctx = self._construire_requete_contextualisee(message, dernier_prompt, derniere_reponse)
         vec_ctx = _embed_texte_cache(embed_model, requete_ctx)
 

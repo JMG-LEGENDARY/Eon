@@ -11,18 +11,33 @@ from typing import Callable
 import terminal_panels as panels
 
 BASE_DIR = Path(__file__).resolve().parent
-MODE_SHELL = "auto"  # La confirmation est gérée en amont par main.py (ou via CALLBACK_CONFIRMATION)
+MODE_SHELL = "auto"  # La confirmation interactive est gérée en amont par main.py
 CALLBACK_CONFIRMATION: Callable[[str], bool] | None = None
 
 COMMANDES_BLOQUEES = re.compile(
-    r"(\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(/|~|\$HOME|\*)\b|"
-    r"\bmkfs\b|\bdd\s+if=|:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;|"
-    r"\b(shutdown|reboot|poweroff|init\s+0)\b|>\s*/dev/sd[a-z])",
+    r"("
+    r"\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+(/|~|\$HOME|\*)\b|"
+    r"\b(mkfs|wipefs|fdisk|parted)\b|"
+    r"\bdd\s+if=|"
+    r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;|"
+    r"\b(shutdown|reboot|poweroff|halt|init\s+[06])\b|"
+    r">\s*/dev/(sd[a-z]|nvme\d|vd[a-z])|"
+    r"\b(curl|wget)\b[^|\n]+\|\s*(sudo\s+)?(ba|z|da)?sh\b|"
+    r"/dev/(tcp|udp)/|"
+    r"\b(nc|ncat|netcat)\b[^\n;|&]*\s-e\b|"
+    r"\bbash\s+-i\b|"
+    r"\b(chmod|chown)\b[^\n;|&]*\s-R\s+[^\n;|&]*\s+(/|~|\$HOME)\s*$|"
+    r"profil_eon\.json"
+    r")",
     re.IGNORECASE,
 )
+
 REGEX_SUDO = re.compile(r"(^|[;&|]\s*)sudo\b")
 REGEX_COMMANDE_LONGUE = re.compile(r"\b(dnf|flatpak|cargo|pip|uv|npm|git\s+clone)\b", re.IGNORECASE)
-REGEX_DNF_INTERACTIF = re.compile(r"\bdnf\s+(install|upgrade|update|remove|autoremove)\b(?![^\n;|&]*\s-y\b)", re.IGNORECASE)
+REGEX_DNF_INTERACTIF = re.compile(
+    r"\bdnf\s+(install|upgrade|update|remove|autoremove)\b(?![^\n;|&]*\s-y\b)",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -92,15 +107,14 @@ def statut_tache_en_cours() -> str:
 def _normaliser_commande_llm(commande: str) -> str:
     """Corrige les artefacts d'échappement JSON courants produits par les LLM locaux."""
     cmd = commande.strip()
-    # Corrige les subshells mal échappés par le parser JSON (ex: `\\(seq 1 10\\)` -> `$(seq 1 10)`)
     cmd = re.sub(r"\\+\(([^()]+)\\+\)", r"$(\1)", cmd)
-    # Évite qu'un dnf interactif se fige sur [o/N]
     if REGEX_DNF_INTERACTIF.search(cmd):
         cmd = REGEX_DNF_INTERACTIF.sub(r"dnf -y \1", cmd)
     return cmd
 
 
-def _preparer_sudo(commande: str) -> tuple[str, str | None]:
+def _preparer_sudo(commande: str) -> tuple[str, bytes | None]:
+    """Prépare l'élévation sudo sans exposer le mot de passe dans les journaux ni l'environnement."""
     if not REGEX_SUDO.search(commande):
         return commande, None
 
@@ -111,13 +125,19 @@ def _preparer_sudo(commande: str) -> tuple[str, str | None]:
     if test_ticket.returncode == 0:
         return REGEX_SUDO.sub(r"\1sudo -n", commande), None
 
+    panels.log_outil("[SUDO] Authentification administrateur requise.")
     mdp = panels.saisir_mot_de_passe("[Sudo] Mot de passe administrateur : ")
+    if not mdp:
+        raise PermissionError("Mot de passe sudo vide : élévation annulée.")
+
+    payload = (mdp + "\n").encode("utf-8")
+    mdp = ""  # Effacement immédiat de la référence en clair
     commande_stdin = REGEX_SUDO.sub(r'\1sudo -S -p ""', commande)
-    return commande_stdin, f"{mdp}\n"
+    return commande_stdin, payload
 
 
 def executer_commande_shell(commande: str, dossier_travail: str | None = None) -> str:
-    """Exécute une commande bash/shell locale sans bloquer Eon si la tâche est longue ou figée.
+    """Exécute une commande bash/shell locale avec garde-fous de sécurité et suivi non-bloquant.
 
     Args:
         commande: La commande bash à exécuter.
@@ -144,7 +164,8 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
         return "Erreur : commande vide."
 
     if COMMANDES_BLOQUEES.search(cmd_propre):
-        return f"BLOQUÉ PAR SÉCURITÉ : la commande « {cmd_propre} » est interdite."
+        panels.log_outil(f"[SÉCURITÉ SHELL] Commande bloquée : {cmd_propre}")
+        return f"BLOQUÉ PAR SÉCURITÉ : la commande « {cmd_propre} » est interdite par la politique système."
 
     if dossier_travail:
         candidat = Path(dossier_travail).expanduser()
@@ -161,8 +182,8 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
 
     try:
         cmd_exec, stdin_sudo = _preparer_sudo(cmd_propre)
-    except (KeyboardInterrupt, EOFError):
-        return "Annulé : saisie du mot de passe sudo interrompue."
+    except (KeyboardInterrupt, EOFError, PermissionError) as err_sudo:
+        return f"Annulé : {err_sudo}"
 
     delai_max = 900 if REGEX_COMMANDE_LONGUE.search(cmd_propre) else 45
     panels.log_outil(f"$ {cmd_propre}")
@@ -186,7 +207,8 @@ def executer_commande_shell(commande: str, dossier_travail: str | None = None) -
         if proc.stdin is not None:
             try:
                 if stdin_sudo is not None:
-                    proc.stdin.write(stdin_sudo.encode("utf-8"))
+                    proc.stdin.write(stdin_sudo)
+                    stdin_sudo = None
                 proc.stdin.close()
             except BrokenPipeError:
                 pass

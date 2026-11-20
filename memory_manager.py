@@ -20,9 +20,18 @@ MEMOIRE_EPISODIQUE_FILE = BASE_DIR / "memoire_episodique.jsonl"
 _DB_LOCK = threading.RLock()
 _DB_INITIALISEE = False
 
+REGEX_SECRET_MEMOIRE = re.compile(
+    r"(sudo\s+-S|mot\s+de\s+passe|password|passwd|api[_-]?key|token\s*=|secret\s*=|-----BEGIN\s+[A-Z ]+PRIVATE\s+KEY-----)",
+    re.IGNORECASE,
+)
+
+
+def _contient_secret(texte: str) -> bool:
+    return bool(REGEX_SECRET_MEMOIRE.search(texte))
+
 
 def _obtenir_cle() -> bytes:
-    """Charge ou génère une clé locale de 32 octets."""
+    """Charge ou génère une clé locale de 32 octets avec permissions restreintes."""
     if CLE_HISTORIQUE_FILE.exists():
         cle = CLE_HISTORIQUE_FILE.read_bytes()
         if cle:
@@ -42,15 +51,24 @@ def _flux_masque(data: bytes, cle: bytes) -> bytes:
     return bytes(a ^ b for a, b in zip(data, flux))
 
 
-def _ecrire_atomique_texte(chemin: Path, contenu: str) -> None:
-    tmp = chemin.with_suffix(".tmp")
+def _ecrire_atomique_texte(chemin: Path, contenu: str, mode: int | None = None) -> None:
+    tmp = Path(f"{chemin}.tmp")
     tmp.write_text(contenu, encoding="utf-8")
+    if mode is not None:
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
     os.replace(tmp, chemin)
 
 
-def _ecrire_atomique_bytes(chemin: Path, contenu: bytes) -> None:
-    tmp = chemin.with_suffix(".tmp")
+def _ecrire_atomique_bytes(chemin: Path, contenu: bytes, mode: int = 0o600) -> None:
+    tmp = Path(f"{chemin}.tmp")
     tmp.write_bytes(contenu)
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
     os.replace(tmp, chemin)
 
 
@@ -104,6 +122,7 @@ def _connexion_db() -> sqlite3.Connection:
                 )
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_echanges_session ON echanges(session_id, id);")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_echanges_date ON echanges(date);")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_echanges_echec ON echanges(echec_detecte, id);")
                 conn.commit()
                 _DB_INITIALISEE = True
                 _migrer_anciennes_archives(conn)
@@ -111,21 +130,27 @@ def _connexion_db() -> sqlite3.Connection:
 
 
 def _migrer_anciennes_archives(conn: sqlite3.Connection) -> None:
-    """Migre automatiquement historique_brut.bin ou .jsonl vers SQLite au premier lancement."""
+    """Migre automatiquement historique_brut.bin (SHAKE-256 ou legacy XOR) ou .jsonl vers SQLite."""
     cur = conn.execute("SELECT COUNT(*) FROM echanges")
     if cur.fetchone()[0] > 0:
         return
 
     anciens: list[dict[str, Any]] = []
     if HISTORIQUE_BIN_FILE.exists():
-        try:
-            brut = HISTORIQUE_BIN_FILE.read_bytes()
-            cle = _obtenir_cle()
-            compresse = bytes(b ^ cle[i % len(cle)] for i, b in enumerate(brut))
-            texte = zlib.decompress(compresse).decode("utf-8")
-            anciens = _parser_lignes_jsonl(texte)
-        except Exception:
-            anciens = []
+        brut = HISTORIQUE_BIN_FILE.read_bytes()
+        cle = _obtenir_cle()
+        for dechiffreur in (
+            lambda b: _flux_masque(b, cle),
+            lambda b: bytes(x ^ cle[i % len(cle)] for i, x in enumerate(b)),
+        ):
+            try:
+                compresse = dechiffreur(brut)
+                texte = zlib.decompress(compresse).decode("utf-8")
+                anciens = _parser_lignes_jsonl(texte)
+                if anciens:
+                    break
+            except Exception:
+                continue
     elif HISTORIQUE_LEGACY_FILE.exists():
         anciens = _lire_jsonl(HISTORIQUE_LEGACY_FILE)
 
@@ -189,7 +214,7 @@ def sauvegarder_tous_echanges(echanges: list[dict[str, Any]]) -> None:
         texte_jsonl += "\n"
     compresse = zlib.compress(texte_jsonl.encode("utf-8"), level=6)
     masque = _flux_masque(compresse, _obtenir_cle())
-    _ecrire_atomique_bytes(HISTORIQUE_BIN_FILE, masque)
+    _ecrire_atomique_bytes(HISTORIQUE_BIN_FILE, masque, mode=0o600)
 
 
 def journaliser_echange(entree: dict[str, Any]) -> None:
@@ -224,6 +249,65 @@ def marquer_dernier_echange_echec(raison_echec: str, modele_corrige: str | None 
             """,
             (raison_echec, modele_corrige, json.dumps(data, ensure_ascii=False), row["id"]),
         )
+        conn.commit()
+
+
+def extraire_cas_regression(limite: int = 40) -> list[dict[str, Any]]:
+    """
+    Extrait un échantillon d'échanges réels validés (succès audités et anciens échecs corrigés)
+    pour alimenter le replay de régression d'optimizer.py.
+    """
+    with _DB_LOCK:
+        conn = _connexion_db()
+        rows = conn.execute(
+            """
+            SELECT prompt, modele, modele_attendu, raison, echec_detecte, payload_json
+            FROM echanges
+            WHERE prompt != '' AND raison != 'règle:phatique'
+            ORDER BY id DESC LIMIT ?
+            """,
+            (max(10, int(limite) * 2),),
+        ).fetchall()
+
+    cas: list[dict[str, Any]] = []
+    vus: set[str] = set()
+    for r in rows:
+        try:
+            payload = json.loads(r["payload_json"])
+        except json.JSONDecodeError:
+            continue
+
+        prompt = str(r["prompt"] or "").strip()
+        cle_norm = prompt.lower()
+        if len(prompt) < 6 or cle_norm in vus or _contient_secret(prompt):
+            continue
+
+        est_valide = bool(payload.get("audite_ok")) and not bool(r["echec_detecte"])
+        est_corrige = bool(r["echec_detecte"]) and bool(payload.get("traite_optimiseur")) and bool(r["modele_attendu"])
+
+        if est_valide or est_corrige:
+            vus.add(cle_norm)
+            modele_cible = str(r["modele_attendu"] or r["modele"] or "").strip()
+            if modele_cible:
+                cas.append(
+                    {
+                        "prompt": prompt,
+                        "modele_attendu": modele_cible,
+                        "origine": "echec_corrige" if est_corrige else "succes_audite",
+                    }
+                )
+        if len(cas) >= limite:
+            break
+
+    return cas
+
+
+def compacter_base_donnees() -> None:
+    """Optimise les index SQLite et tronque le journal WAL après une session nocturne."""
+    with _DB_LOCK:
+        conn = _connexion_db()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.execute("PRAGMA optimize;")
         conn.commit()
 
 
@@ -262,17 +346,28 @@ def sauvegarder_memoire_utile(memoire: dict[str, Any]) -> None:
 
 
 def memoriser_fait_utilisateur(cle: str, valeur: str) -> str:
-    """Enregistre ou met à jour une information durable sur l'utilisateur."""
-    cle_propre = cle.strip().lower().replace(" ", "_")
+    """Enregistre ou met à jour une information durable sur l'utilisateur (hors secrets)."""
+    cle_propre = re.sub(r"[^a-z0-9_]", "_", cle.strip().lower()).strip("_")
     val_propre = valeur.strip()
     if not cle_propre or not val_propre:
         return "Erreur : clé ou valeur vide."
+    if _contient_secret(f"{cle_propre} {val_propre}"):
+        return "Refus sécurité : donnée sensible non enregistrée en mémoire."
 
     memoire = charger_memoire_utile()
     memoire[cle_propre] = {
         "valeur": val_propre,
         "maj": datetime.now().isoformat(timespec="seconds"),
     }
+    # Plafonne à 80 faits les plus récents pour garder le prompt système compact
+    if len(memoire) > 80:
+        cles_triees = sorted(
+            memoire.keys(),
+            key=lambda k: memoire[k].get("maj", "") if isinstance(memoire[k], dict) else "",
+        )
+        for ancienne_cle in cles_triees[:-80]:
+            del memoire[ancienne_cle]
+
     sauvegarder_memoire_utile(memoire)
     return f"Fait mémorisé : {cle_propre} = {val_propre}"
 
@@ -380,7 +475,7 @@ def exporter_historique(
     chemin_destination: str = "~/Téléchargements/conversation_eon.txt",
     limite: int = 100,
 ) -> str:
-    """Exporte les vrais échanges enregistrés depuis la base SQLite vers un fichier texte sur le disque."""
+    """Exporte les vrais échanges enregistrés depuis la base SQLite vers un fichier texte protégé."""
     nettoye = re.sub(r"/\s+", "/", (chemin_destination or "").strip().strip("\"'"))
     cible = Path(nettoye or "~/Téléchargements/conversation_eon.txt").expanduser()
     if not cible.is_absolute():
@@ -394,6 +489,10 @@ def exporter_historique(
     racine_home = Path.home().resolve()
     if racine_home not in cible.parents and cible != racine_home:
         return f"Erreur : chemin d'export refusé hors de {racine_home} ({cible})."
+
+    # Empêche l'écrasement du code source d'Eon ou des dossiers sensibles
+    if BASE_DIR in cible.parents or cible.parent == BASE_DIR or cible.suffix.lower() not in (".txt", ".md", ".log"):
+        return f"Erreur sécurité : destination d'export invalide ({cible.name}). Utilisez un fichier .txt ou .md hors du dossier moteur."
 
     nb = max(1, min(int(limite), 1000))
     with _DB_LOCK:
@@ -423,7 +522,7 @@ def exporter_historique(
         lignes_sortie.append("-" * 72)
 
     cible.parent.mkdir(parents=True, exist_ok=True)
-    _ecrire_atomique_texte(cible, "\n".join(lignes_sortie) + "\n")
+    _ecrire_atomique_texte(cible, "\n".join(lignes_sortie) + "\n", mode=0o600)
     return f"Historique réel exporté avec succès ({len(rows)} échanges) dans : {cible}"
 
 

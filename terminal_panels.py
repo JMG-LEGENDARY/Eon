@@ -144,7 +144,6 @@ if TEXTUAL_DISPONIBLE:
             self._lock_fichiers = threading.Lock()
             self._tampon_chat = ""
 
-            # File d'attente pour les demandes de confirmation synchrones (shell/fichiers/sudo)
             self._attente_reponse: queue.Queue[str] | None = None
             self._lock_confirmation = threading.Lock()
 
@@ -179,6 +178,8 @@ if TEXTUAL_DISPONIBLE:
                     pass
 
         def action_interrompre_ia(self) -> None:
+            if _TTS_REF is not None:
+                _TTS_REF.arreter()
             self._on_escape_fn()
 
         def action_effacer_vue_chat(self) -> None:
@@ -212,7 +213,6 @@ if TEXTUAL_DISPONIBLE:
                 pass
 
         def maj_vu_micro(self, texte: str) -> None:
-            """Met à jour la barre de niveau micro en haut de la fenêtre Audio sans faire défiler les logs."""
             def _maj() -> None:
                 try:
                     self.query_one("#vu_micro", Static).update(texte)
@@ -255,7 +255,6 @@ if TEXTUAL_DISPONIBLE:
                 pass
 
         def demander_ligne(self, invite: str, secret: bool = False) -> str:
-            """Permet à un thread d'arrière-plan (shell_tools/file_tools) de demander une confirmation ou un mot de passe."""
             q: queue.Queue[str] = queue.Queue(maxsize=1)
             with self._lock_confirmation:
                 self._attente_reponse = q
@@ -300,6 +299,15 @@ if TEXTUAL_DISPONIBLE:
             texte = valeur.strip()
             if not texte:
                 return
+
+            # Alerte vocale prioritaire si une personne non reconnue tape dans le terminal
+            if _PERCEPTION_REF is not None:
+                autorise_clavier, detail = _PERCEPTION_REF.verifier_identite_clavier()
+                if not autorise_clavier:
+                    self.journaliser("logs", f"[ALERTE CLAVIER] Frappe détectée par personne non reconnue ({detail})")
+                    if _TTS_REF is not None:
+                        _TTS_REF.alerter("Attention, saisie clavier détectée par un utilisateur non reconnu.")
+
             self.query_one("#panneau_chat", RichLog).write(f"\nVous : {texte}")
             self._on_prompt_fn(texte)
 
@@ -308,16 +316,24 @@ _APP_TUI: "EonTUIApp | None" = None
 _FALLBACK: _GestionnaireConsoleFallback | None = None
 _CB_ENTREE_CLAVIER: Callable[[str], None] | None = None
 _CB_INTERRUPTION: Callable[[], None] | None = None
+_PERCEPTION_REF = None
+_TTS_REF = None
 
 
 def enregistrer_callbacks_ui(
     on_prompt: Callable[[str], None],
     on_escape: Callable[[], None],
 ) -> None:
-    """Connecte la barre de saisie Textual et la touche Échap à PerceptionEon."""
     global _CB_ENTREE_CLAVIER, _CB_INTERRUPTION
     _CB_ENTREE_CLAVIER = on_prompt
     _CB_INTERRUPTION = on_escape
+
+
+def connecter_capteurs_et_voix(perception=None, tts=None) -> None:
+    """Relie PerceptionEon et ClientTTSEon à l'interface pour les alertes et l'arrêt d'urgence."""
+    global _PERCEPTION_REF, _TTS_REF
+    _PERCEPTION_REF = perception
+    _TTS_REF = tts
 
 
 def tui_active() -> bool:
@@ -336,7 +352,6 @@ def configurer(dossier_base: Path) -> None:
 
 
 def lancer_avec_interface(dossier_base: Path, boucle_principale: Callable[[], None]) -> None:
-    """Lance Textual si disponible dans un terminal interactif, sinon exécute directement boucle_principale."""
     global _APP_TUI
     configurer(dossier_base)
 

@@ -3,6 +3,7 @@ import inspect
 import json
 import re
 import threading
+import time
 import uuid
 from typing import Any, Callable
 
@@ -21,6 +22,7 @@ from memory_manager import (
 )
 from perception_eon import MessageEntrant, PerceptionEon
 from router import RouteurAutonome
+from tts_client import ClientTTSEon
 
 try:
     from context_compressor import GestionnaireContexteMultiNiveaux
@@ -106,15 +108,19 @@ def _collecter_fonctions_module(mod: Any, noms_autorises: set[str] | None = None
 
 
 class ApplicationEon:
-    """Orchestrateur principal d'Eon (Routage sémantique, mémoire 3 niveaux, capteurs et outils)."""
+    """Orchestrateur principal d'Eon (Routage sémantique, mémoire 3 niveaux, pré-chauffage au regard et outils)."""
 
     def __init__(self) -> None:
         self.session_id = uuid.uuid4().hex[:12]
         self.routeur = RouteurAutonome()
+        self.tts = ClientTTSEon(config_eon=self.routeur.config.get("tts", {}))
         self.perception = PerceptionEon(
             config_eon=self.routeur.config.get("perception", {}),
             on_alerte_securite=self._gerer_alerte_securite,
+            on_regard_detecte=self._prechauffer_au_regard,
         )
+        self.perception.attacher_tts(self.tts)
+
         embed_model = self.routeur.config.get("routage", {}).get("embed_model", "bge-m3")
         self.compresseur = (
             GestionnaireContexteMultiNiveaux(modele_compresseur="qwen3:0.6b", embed_model=embed_model)
@@ -129,6 +135,9 @@ class ApplicationEon:
         self.dernier_prompt_valide: str = ""
         self.derniere_reponse_valide: str = ""
         self.journal_outils_session: list[str] = []
+
+        self._lock_prechauffage = threading.Lock()
+        self._cache_capteurs_prechauffes: tuple[float, str] = (0.0, "")
 
         self.catalogue_web = _collecter_fonctions_module(web_tools)
         self.catalogue_files = _collecter_fonctions_module(file_tools)
@@ -145,6 +154,34 @@ class ApplicationEon:
     def _gerer_alerte_securite(self, message_alerte: str) -> None:
         _log_outil(message_alerte)
         panels.ecrire_chat(f"\n⚠️ {message_alerte}")
+
+    def _prechauffer_au_regard(self) -> None:
+        """Pré-assemble le contexte et garde le modèle conversationnel chaud dès que l'utilisateur regarde l'écran."""
+        if not self._lock_prechauffage.acquire(blocking=False):
+            return
+        try:
+            if self.perception.ia_en_cours.is_set() or self.tts.est_en_train_de_parler():
+                return
+
+            etat_frais = self.perception.decrire_etat_capteurs()
+            self._cache_capteurs_prechauffes = (time.monotonic(), etat_frais)
+
+            cible = self.modele_verrouille or self.dernier_modele or self.routeur.config.get("route_defaut", "qwen2.5:7B")
+            if "12b" in cible.lower() or "14b" in cible.lower():
+                cible = self.routeur.config.get("route_defaut", "qwen2.5:7B")
+
+            _log_outil(f"[PRÉDICTIF] Regard détecté -> pré-chauffage contexte & {cible}...")
+            ollama.generate(
+                model=cible,
+                prompt=" ",
+                options={"num_predict": 1, "temperature": 0.0},
+                keep_alive="2m",
+            )
+            self.modele_gpu_charge = cible
+        except Exception:
+            pass
+        finally:
+            self._lock_prechauffage.release()
 
     def _obtenir_modele_vlm(self) -> str | None:
         for nom, cfg in self.routeur.config.get("routes", {}).items():
@@ -190,10 +227,16 @@ class ApplicationEon:
             outils.update(self.catalogue_shell)
         return outils
 
-    def _construire_system_prompt(self, modele: str, route_cfg: dict) -> str:
+    def _construire_system_prompt(self, modele: str, route_cfg: dict, source_message: str = "clavier") -> str:
         maintenant = datetime.datetime.now()
         date_fr = maintenant.strftime("%A %d/%m/%Y %H:%M")
-        etat_capteurs = self.perception.decrire_etat_capteurs()
+
+        ts_cache, etat_cache = self._cache_capteurs_prechauffes
+        if etat_cache and (time.monotonic() - ts_cache) <= 3.0:
+            etat_capteurs = etat_cache
+        else:
+            etat_capteurs = self.perception.decrire_etat_capteurs()
+
         regles = self.routeur.config.get("regles_apprises", [])
         bloc_regles = "\n".join(f"- {r}" for r in regles) if regles else "- Sois précis, direct et factuel."
 
@@ -205,6 +248,13 @@ class ApplicationEon:
         except Exception:
             pass
 
+        consigne_orale = (
+            "\n4. MODE VOCAL ACTIF : L'utilisateur te parle à l'oral. Commence toujours par une synthèse "
+            "directe en 1 à 2 phrases naturelles (sans lire de syntaxe code), puis détaille à l'écrit si nécessaire."
+            if source_message == "voix"
+            else ""
+        )
+
         return (
             f"Tu es Eon, l'assistant IA personnel et local de Bryan (machine Linux Fedora, Reims, France).\n"
             f"Date et heure actuelles : {date_fr}.\n"
@@ -214,17 +264,21 @@ class ApplicationEon:
             "RÈGLES IMPÉRATIVES :\n"
             "1. PRIORITÉ ABSOLUE AUX RÉSULTATS WEB : Si un outil de recherche internet (`rechercher_sur_internet` ou `lire_page_web`) "
             "retourne un fait daté qui contredit tes connaissances internes ou tes réponses précédentes dans la conversation, "
-            "le résultat de l'outil a TOUJOURS raison. Ne répète jamais une ancienne erreur.\n"
+            "le résultat de l'outil a TOUJOURS raison. Si l'outil signale une faible pertinence ou un échec, n'invente rien.\n"
             "2. HONNÊTETÉ DES OUTILS : Ne simule jamais l'exécution d'une commande, le contenu d'un fichier ou un historique de conversation. "
             "Utilise toujours les vrais outils (`exporter_historique`, `lire_fichier`, `ecrire_fichier`, `executer_commande_shell`, `observer_camera`).\n"
-            "3. CONCISION ET TON : Réponds en français naturel, direct et efficace, sans blabla inutile.\n"
+            "3. CONCISION ET TON : Réponds en français naturel, direct et efficace, sans blabla inutile."
+            f"{consigne_orale}\n"
             f"{bloc_regles}"
         )
 
-    def _demander_confirmation_outil(self, nom_outil: str, args: dict) -> bool:
-        """Demande l'accord de l'utilisateur pour un outil sensible via le routeur sémantique."""
+    def _demander_confirmation_outil(self, nom_outil: str, args: dict, source_message: str = "clavier") -> bool:
+        """Demande l'accord de l'utilisateur (clavier ou voix) pour un outil sensible."""
         resume_args = json.dumps(args, ensure_ascii=False)[:180]
         panels.ecrire_chat(f"\n[AUTORISATION REQUISE] Exécuter `{nom_outil}({resume_args})` ? (oui/non)")
+        if source_message == "voix":
+            self.tts.alerter(f"Confirmation requise pour exécuter {nom_outil}. Dis oui ou non.")
+
         self.perception.autoriser_saisie()
         reponse = self.perception.attendre_message()
         if reponse is None:
@@ -233,7 +287,13 @@ class ApplicationEon:
         _log_outil(f"[CONSENTEMENT] {nom_outil} -> {'AUTORISÉ' if accord else 'REFUSÉ'} ({raison})")
         return accord
 
-    def _executer_outil(self, nom_outil: str, args: dict, outils_disponibles: dict[str, Callable]) -> str:
+    def _executer_outil(
+        self,
+        nom_outil: str,
+        args: dict,
+        outils_disponibles: dict[str, Callable],
+        source_message: str = "clavier",
+    ) -> str:
         fn = outils_disponibles.get(nom_outil)
         if fn is None:
             return f"Erreur : outil `{nom_outil}` non autorisé ou indisponible pour ce modèle."
@@ -242,10 +302,10 @@ class ApplicationEon:
         shell_mode = self.routeur.config.get("shell_mode", "auto")
 
         if nom_outil in OUTILS_SENSIBLES_FICHIERS and file_mode == "ask":
-            if not self._demander_confirmation_outil(nom_outil, args):
+            if not self._demander_confirmation_outil(nom_outil, args, source_message=source_message):
                 return "Action annulée par l'utilisateur."
         elif nom_outil in OUTILS_SENSIBLES_SHELL and shell_mode == "ask":
-            if not self._demander_confirmation_outil(nom_outil, args):
+            if not self._demander_confirmation_outil(nom_outil, args, source_message=source_message):
                 return "Commande shell annulée par l'utilisateur."
 
         ts = datetime.datetime.now().strftime("%H:%M:%S")
@@ -279,14 +339,17 @@ class ApplicationEon:
         historique: list[dict[str, Any]],
         images: list[bytes] | None = None,
         forcer_web: bool = False,
+        source_message: str = "clavier",
     ) -> str:
-        """Exécute la boucle autonome d'appel d'outils et de streaming interruptible."""
+        """Exécute la boucle autonome d'appel d'outils, de streaming TUI et de synthèse vocale."""
         self._liberer_vram_si_changement_lourd(modele)
+        self.tts.demarrer_tour_reponse(source_message)
+
         outils_dispo = self._assembler_outils_tour(modele, route_cfg, forcer_web=forcer_web)
         liste_callables = list(outils_dispo.values()) if not images else []
 
         messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._construire_system_prompt(modele, route_cfg)}
+            {"role": "system", "content": self._construire_system_prompt(modele, route_cfg, source_message=source_message)}
         ]
         messages.extend(historique)
 
@@ -303,7 +366,11 @@ class ApplicationEon:
         if route_cfg.get("num_gpu") is not None:
             options_ollama["num_gpu"] = int(route_cfg["num_gpu"])
 
-        keep_alive = "30s" if ("12b" in modele.lower() or "14b" in modele.lower()) else "5m"
+        tts_actif = self.tts.daemon_disponible()
+        if "12b" in modele.lower() or "14b" in modele.lower():
+            keep_alive = 0 if tts_actif else "30s"
+        else:
+            keep_alive = "45s" if tts_actif else "5m"
 
         self.perception.interruption_event.clear()
         self.perception.ia_en_cours.set()
@@ -383,10 +450,12 @@ class ApplicationEon:
                         if not texte_etape and not reponse_finale_chunks:
                             panels.ecrire_chat(f"\nEon ({modele}) : ", fin="")
                         panels.ecrire_chat(contenu, fin="")
+                        self.tts.pousser_token_stream(contenu)
                         texte_etape += contenu
                         reponse_finale_chunks.append(contenu)
 
                 if self.perception.interruption_event.is_set():
+                    self.tts.arreter()
                     panels.ecrire_chat("\n[Génération interrompue]")
                     break
 
@@ -424,7 +493,12 @@ class ApplicationEon:
                         )
                     else:
                         appels_deja_faits.add(signature_appel)
-                        res_outil = self._executer_outil(nom_fn, args_dict, outils_dispo)
+                        res_outil = self._executer_outil(
+                            nom_fn,
+                            args_dict,
+                            outils_dispo,
+                            source_message=source_message,
+                        )
 
                     messages.append(
                         {
@@ -433,6 +507,8 @@ class ApplicationEon:
                         }
                     )
 
+            if not self.perception.interruption_event.is_set():
+                self.tts.vider_stream()
             panels.ecrire_chat("")
             panels.flush_chat()
         except Exception as err:
@@ -455,6 +531,7 @@ class ApplicationEon:
         arg = morceaux[1].strip() if len(morceaux) > 1 else ""
 
         if cmd in ("/quit", "/exit"):
+            self.tts.arreter()
             self.perception.arret_global.set()
             return False
 
@@ -464,6 +541,7 @@ class ApplicationEon:
                 "  @<alias> <prompt>      : Forcer un modèle sur un seul message (ex: @code+, @12b, @c)\n"
                 "  /model <alias|auto>    : Verrouiller un modèle ou revenir au routage automatique\n"
                 "  /models                : Lister les modèles, alias et rôles configurés\n"
+                "  /tts [status|test|stop]: Tester ou contrôler le démon vocal Chatterbox\n"
                 "  /history [N]           : Afficher les N derniers échanges et les logs d'outils\n"
                 "  /export [chemin]       : Exporter l'historique réel dans un fichier texte\n"
                 "  /enroll [nom|reset]    : Enregistrer un visage autorisé ou réinitialiser la biométrie\n"
@@ -475,6 +553,22 @@ class ApplicationEon:
                 "  /optimize [min]        : Lancer l'optimisation fine en arrière-plan (défaut 55 min)\n"
                 "  /quit                  : Quitter Eon"
             )
+            return True
+
+        if cmd == "/tts":
+            sous = arg.lower() or "status"
+            if sous == "stop":
+                self.tts.arreter()
+                panels.ecrire_chat("\n[TTS] Lecture vocale interrompue.")
+            elif sous == "test":
+                if self.tts.daemon_disponible():
+                    self.tts.alerter("Liaison vocale opérationnelle entre Eon et le démon Chatterbox.")
+                    panels.ecrire_chat("\n[TTS] Test envoyé au démon vocal.")
+                else:
+                    panels.ecrire_chat(f"\n[TTS] Démon inactif sur {self.tts.socket_path}. Lance `tts_daemon.py --daemon`.")
+            else:
+                etat = "ACTIF" if self.tts.daemon_disponible() else "INACTIF"
+                panels.ecrire_chat(f"\n[TTS] Statut : {etat} | Socket : {self.tts.socket_path}")
             return True
 
         if cmd == "/optimize":
@@ -585,8 +679,9 @@ class ApplicationEon:
 
     def boucle_principale(self) -> None:
         self.perception.demarrer()
+        etat_tts = "voix active" if self.tts.daemon_disponible() else "démon vocal inactif"
         panels.ecrire_chat(
-            "Eon est prêt (Routage sémantique + Mémoire 3 niveaux VRAM/RAM/Disque). Tape `/help` pour les commandes."
+            f"Eon est prêt (Routage sémantique + Mémoire 3 niveaux + {etat_tts}). Tape `/help` pour les commandes."
         )
 
         while not self.perception.arret_global.is_set():
@@ -616,9 +711,16 @@ class ApplicationEon:
                     modele_force = cand
                     prompt_effectif = match_at.group(2).strip()
 
-            # Affiche les messages vocaux dans le panneau Conversation (les messages clavier le sont déjà par Textual)
             if getattr(entrant, "source", "") == "voix":
                 panels.ecrire_chat(f"\nVous (voix) : {prompt_effectif}")
+                prompt_normalise = self.routeur.normaliser_intention_vocale(
+                    prompt_effectif,
+                    dernier_prompt=self.dernier_prompt_valide,
+                    derniere_reponse=self.derniere_reponse_valide,
+                )
+                if prompt_normalise != prompt_effectif:
+                    _log_outil(f"[ASR FIX] « {prompt_effectif} » -> « {prompt_normalise} »")
+                    prompt_effectif = prompt_normalise
 
             # 1. Évaluation d'insatisfaction / rejet de la réponse précédente
             est_echec = False
@@ -646,7 +748,7 @@ class ApplicationEon:
                 texte_routage = prompt_effectif
                 historique_tour = []
 
-            # 3. Analyse sémantique des intentions latentes (sans regex)
+            # 3. Analyse sémantique des intentions latentes
             intentions = self.routeur.analyser_intentions(
                 prompt_effectif,
                 dernier_prompt=self.dernier_prompt_valide,
@@ -704,7 +806,7 @@ class ApplicationEon:
             route_cfg = self.routeur.config.get("routes", {}).get(modele_final, {})
             _log_outil(f"[ROUTE] {modele_final} (score={score_route:.2f} | {raison_route})")
 
-            # 5. Exécution autonome (streaming + outils)
+            # 5. Exécution autonome (streaming + outils + voix si source == "voix")
             reponse = self.executer_tour_autonome(
                 modele=modele_final,
                 route_cfg=route_cfg,
@@ -712,6 +814,7 @@ class ApplicationEon:
                 historique=historique_tour,
                 images=images_tour,
                 forcer_web=forcer_web,
+                source_message=entrant.source,
             )
 
             # 6. Mise à jour mémoire SQLite + compression asynchrone en RAM (0 ms de latence)
@@ -744,6 +847,7 @@ def main() -> None:
     app = ApplicationEon()
 
     try:
+        panels.connecter_capteurs_et_voix(perception=app.perception, tts=app.tts)
         panels.enregistrer_callbacks_ui(
             on_prompt=app.perception.soumettre_texte_clavier,
             on_escape=app.perception.declencher_interruption,
@@ -752,6 +856,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        app.tts.arreter()
         app.perception.arret_global.set()
         panels.fermer()
 

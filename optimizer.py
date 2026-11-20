@@ -5,6 +5,8 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from collections import defaultdict
 from datetime import datetime
@@ -18,6 +20,8 @@ from memory_manager import (
     MEMOIRE_EPISODIQUE_FILE,
     charger_memoire_utile,
     charger_tous_echanges,
+    compacter_base_donnees,
+    extraire_cas_regression,
     memoriser_fait_utilisateur,
     sauvegarder_tous_echanges,
 )
@@ -30,12 +34,12 @@ except ImportError:
 CONFIG_FILE = BASE_DIR / "config_ia.json"
 CONFIG_BACKUP_FILE = BASE_DIR / "config_ia.bak.json"
 TRAINING_FILE = BASE_DIR / "entrainement_routage.json"
+REGRESSION_SUITE_FILE = BASE_DIR / "tests_regression_eon.json"
 OPTIMISEUR_LOG_FILE = BASE_DIR / "optimiseur_journal.log"
 RAPPORT_FINAL_FILE = BASE_DIR / "dernier_rapport_optimisation.md"
 BACKUPS_DIR = BASE_DIR / "backups_config"
 HISTORIQUE_OPTI_FILE = BACKUPS_DIR / "historique_optimisations.json"
 
-# Bornes strictes et pas initiaux maximums pour garantir une recherche fine et progressive
 SPECS_PARAMETRES: dict[str, dict[str, float]] = {
     "routage.seuils.confiance_directe": {"min": 0.48, "max": 0.78, "pas_max": 0.06, "defaut": 0.63},
     "routage.seuils.marge_directe": {"min": 0.015, "max": 0.14, "pas_max": 0.025, "defaut": 0.05},
@@ -45,16 +49,27 @@ SPECS_PARAMETRES: dict[str, dict[str, float]] = {
 }
 
 REGEX_SECRET = re.compile(
-    r"(sudo\s+-S|mot\s+de\s+passe|password|passwd|api[_-]?key|token\s*=|secret\s*=)",
+    r"(sudo\s+-S|mot\s+de\s+passe|password|passwd|api[_-]?key|token\s*=|secret\s*=|-----BEGIN\s+[A-Z ]+PRIVATE\s+KEY-----)",
     re.IGNORECASE,
 )
+
+# Socle minimal de non-régression couvrant les rôles et intentions critiques d'Eon
+CAS_REGRESSION_CANONIQUES: list[dict[str, str]] = [
+    {"prompt": "Écris un script Python asynchrone pour scanner des ports TCP locaux.", "role_attendu": "code"},
+    {"prompt": "Corrige l'erreur de segmentation dans ce code C avec Valgrind.", "role_attendu": "code"},
+    {"prompt": "Vérifie l'espace disque disponible et la température du CPU sur Fedora.", "intention_attendue": "shell"},
+    {"prompt": "Lis les 50 premières lignes du fichier main.py dans le projet.", "intention_attendue": "fichiers"},
+    {"prompt": "Quelles sont les dernières vulnérabilités Linux publiées cette semaine ?", "intention_attendue": "web"},
+    {"prompt": "Regarde par la webcam qui est assis devant l'ordinateur.", "intention_attendue": "vision"},
+    {"prompt": "Explique la différence théorique entre le chiffrement symétrique AES-GCM et ChaCha20.", "role_attendu": "general"},
+]
 
 
 # ---------------- UTILITAIRES ATOMIQUES & LOGS ----------------
 
 def _ecrire_atomique(chemin: Path, contenu: str) -> None:
     chemin.parent.mkdir(parents=True, exist_ok=True)
-    tmp = chemin.with_suffix(chemin.suffix + ".tmp")
+    tmp = Path(f"{chemin}.tmp")
     tmp.write_text(contenu, encoding="utf-8")
     os.replace(tmp, chemin)
 
@@ -97,7 +112,7 @@ def _cosinus(v1: list[float], v2: list[float]) -> float:
     return sum(a * b for a, b in zip(v1, v2)) / (n1 * n2) if n1 > 0.0 and n2 > 0.0 else 0.0
 
 
-# ---------------- GARDIEN THERMIQUE (LAPTOP SILENCIEUX) ----------------
+# ---------------- GARDIEN THERMIQUE & ALIMENTATION LAPTOP ----------------
 
 def _lire_temperatures() -> tuple[float | None, float | None]:
     """Lit la température GPU (nvidia-smi) et CPU (/sys/class/thermal) en °C."""
@@ -132,6 +147,31 @@ def _lire_temperatures() -> tuple[float | None, float | None]:
     return temp_gpu, temp_cpu
 
 
+def _etat_alimentation_portable() -> tuple[bool, int]:
+    """Retourne (sur_secteur, pourcentage_batterie) via /sys/class/power_supply."""
+    sur_secteur = True
+    niveau_bat = 100
+    try:
+        ps_dir = Path("/sys/class/power_supply")
+        if not ps_dir.exists():
+            return True, 100
+        for bat in sorted(ps_dir.glob("BAT*")):
+            statut_f = bat / "status"
+            cap_f = bat / "capacity"
+            if statut_f.exists():
+                statut = statut_f.read_text(encoding="utf-8").strip().lower()
+                if statut == "discharging":
+                    sur_secteur = False
+            if cap_f.exists():
+                raw_cap = cap_f.read_text(encoding="utf-8").strip()
+                if raw_cap.isdigit():
+                    niveau_bat = int(raw_cap)
+            break
+    except Exception:
+        pass
+    return sur_secteur, niveau_bat
+
+
 def _pause_thermique_adaptative(
     journal: list[str],
     pause_base_sec: float = 4.0,
@@ -152,7 +192,7 @@ def _pause_thermique_adaptative(
         time.sleep(8.0)
         attentes += 1
         t_gpu, t_cpu = _lire_temperatures()
-        if attentes >= 15:  # Max 2 min d'attente par palier
+        if attentes >= 15:
             break
 
 
@@ -186,12 +226,25 @@ def _creer_snapshot_backup(horodatage_id: str) -> str:
     if TRAINING_FILE.exists():
         shutil.copy2(TRAINING_FILE, BACKUPS_DIR / f"entrainement_routage_{horodatage_id}.json")
 
-    # Conserve les 25 derniers snapshots pour ne pas encombrer le disque
     for prefixe in ("config_ia_*.json", "entrainement_routage_*.json"):
         anciens = sorted(BACKUPS_DIR.glob(prefixe))
         for f in anciens[:-25]:
             f.unlink(missing_ok=True)
     return f"backups_config/config_ia_{horodatage_id}.json"
+
+
+def _restaurer_snapshot_backup(horodatage_id: str) -> bool:
+    """Restaure immédiatement config_ia.json et entrainement_routage.json en cas de régression."""
+    restaure = False
+    bak_cfg = BACKUPS_DIR / f"config_ia_{horodatage_id}.json"
+    bak_trn = BACKUPS_DIR / f"entrainement_routage_{horodatage_id}.json"
+    if bak_cfg.exists():
+        shutil.copy2(bak_cfg, CONFIG_FILE)
+        restaure = True
+    if bak_trn.exists():
+        shutil.copy2(bak_trn, TRAINING_FILE)
+        restaure = True
+    return restaure
 
 
 def _formater_contexte_backups(hist: dict[str, Any]) -> str:
@@ -228,12 +281,6 @@ def _calculer_valeur_dichotomique(
     spec: dict[str, float],
     hist: dict[str, Any],
 ) -> tuple[float, str]:
-    """
-    Applique une mise à jour amortie de type dichotomie :
-    - Empêche tout saut brutal (ex: 0.2 -> 0.9 interdit).
-    - Si le paramètre inverse sa direction (+ puis - ou inversement), divise le pas max par 2
-      pour converger finement : ex. 0.20 -> 0.32 -> 0.26 -> 0.29.
-    """
     trajs = hist.setdefault("trajectoires_parametres", {})
     etat = trajs.setdefault(
         cle_param,
@@ -250,12 +297,10 @@ def _calculer_valeur_dichotomique(
 
     if dernier_pas != 0.0:
         if (dernier_pas > 0 and signe < 0) or (dernier_pas < 0 and signe > 0):
-            # Inversion de sens détectée -> dichotomie : on divise le pas précédent par 2
             pas_autorise = max(0.005, abs(dernier_pas) * 0.5)
             etat["inversions"] = int(etat.get("inversions", 0)) + 1
             motif_pas = f"dichotomie après inversion (pas réduit à {pas_autorise:.3f})"
         else:
-            # Même direction -> on avance prudemment sans accélérer brutalement
             pas_autorise = min(pas_autorise, max(0.01, abs(dernier_pas) * 0.85))
             motif_pas = f"progression contrôlée (pas max {pas_autorise:.3f})"
     else:
@@ -273,10 +318,143 @@ def _calculer_valeur_dichotomique(
     return nouvelle_val, motif_pas
 
 
-# ---------------- VALIDATION & BACKTEST HORS-LIGNE ----------------
+# ---------------- REPLAY DE RÉGRESSION BOUT-EN-BOUT ----------------
 
 def _obtenir_embed_model(config: dict[str, Any]) -> str:
     return config.get("routage", {}).get("embed_model") or config.get("embed_model") or "bge-m3"
+
+
+def _charger_suite_regression(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Fusionne la suite de régression persistante (tests_regression_eon.json),
+    les cas canoniques et les vrais cas historiques validés en SQLite.
+    """
+    suite: list[dict[str, Any]] = []
+    vus: set[str] = set()
+
+    if REGRESSION_SUITE_FILE.exists():
+        try:
+            brut = json.loads(REGRESSION_SUITE_FILE.read_text(encoding="utf-8"))
+            if isinstance(brut, list):
+                for item in brut:
+                    if isinstance(item, dict) and item.get("prompt"):
+                        cle = str(item["prompt"]).strip().lower()
+                        if cle not in vus:
+                            vus.add(cle)
+                            suite.append(item)
+        except Exception:
+            pass
+
+    for canon in CAS_REGRESSION_CANONIQUES:
+        cle = canon["prompt"].strip().lower()
+        if cle not in vus:
+            vus.add(cle)
+            suite.append(dict(canon))
+
+    routes_cfg = config.get("routes", {})
+    role_par_modele = {m.lower(): cfg.get("role", "") for m, cfg in routes_cfg.items()}
+
+    for cas_sql in extraire_cas_regression(limite=35):
+        prompt = cas_sql["prompt"].strip()
+        cle = prompt.lower()
+        if cle in vus:
+            continue
+        mod_att = cas_sql["modele_attendu"].lower()
+        role_att = role_par_modele.get(mod_att, "")
+        if role_att:
+            vus.add(cle)
+            suite.append(
+                {
+                    "prompt": prompt,
+                    "role_attendu": role_att,
+                    "origine": cas_sql["origine"],
+                }
+            )
+
+    suite = suite[-80:]
+    _ecrire_atomique(REGRESSION_SUITE_FILE, json.dumps(suite, indent=2, ensure_ascii=False))
+    return suite
+
+
+def _simuler_routage_complet(
+    suite: list[dict[str, Any]],
+    config: dict[str, Any],
+    dataset: dict[str, Any],
+    embed_model: str,
+) -> tuple[float, list[str]]:
+    """
+    Rejoue toute la suite de régression contre le moteur sémantique (rôles + intentions + seuils)
+    et retourne (taux_reussite_pct, liste_regressions).
+    """
+    if not suite:
+        return 100.0, []
+
+    routes_data = dataset.get("routes", {})
+    intentions_data = dataset.get("intentions", {})
+    seuils = config.get("routage", {}).get("seuils", {})
+    seuil_conf = float(seuils.get("confiance_directe", 0.63))
+    seuil_marge = float(seuils.get("marge_directe", 0.05))
+    seuil_int = float(seuils.get("intention_outil", 0.58))
+
+    vecs_roles = {
+        role: ollama.embed(model=embed_model, input=phrases, options={"num_gpu": 0}, keep_alive=-1)["embeddings"]
+        for role, phrases in routes_data.items()
+        if phrases
+    }
+    vecs_intentions = {
+        intent: ollama.embed(model=embed_model, input=phrases, options={"num_gpu": 0}, keep_alive=-1)["embeddings"]
+        for intent, phrases in intentions_data.items()
+        if phrases
+    }
+
+    reussis = 0
+    echecs_replay: list[str] = []
+
+    for cas in suite:
+        prompt = str(cas["prompt"])
+        v_p = ollama.embed(model=embed_model, input=prompt, options={"num_gpu": 0}, keep_alive=-1)["embeddings"][0]
+
+        # 1. Évaluation du rôle prédit (top-3 cosinus moyen)
+        role_predit = "superviseur"
+        if vecs_roles:
+            scores_r = []
+            for role, vecs in vecs_roles.items():
+                sims = sorted((_cosinus(v_p, v) for v in vecs), reverse=True)
+                top = sims[: min(3, len(sims))]
+                scores_r.append((role, sum(top) / len(top)))
+            scores_r.sort(key=lambda x: x[1], reverse=True)
+            top1_r, top1_s = scores_r[0]
+            top2_s = scores_r[1][1] if len(scores_r) > 1 else 0.0
+            if top1_s >= seuil_conf and (top1_s - top2_s) >= seuil_marge:
+                role_predit = top1_r
+            else:
+                # Même en escalade superviseur, le candidat principal reste top1_r
+                role_predit = top1_r
+
+        # 2. Évaluation des intentions outils activées
+        intentions_predites: set[str] = set()
+        for intent, vecs in vecs_intentions.items():
+            sims = sorted((_cosinus(v_p, v) for v in vecs), reverse=True)
+            top = sims[: min(3, len(sims))]
+            if (sum(top) / len(top)) >= seuil_int:
+                intentions_predites.add(intent)
+
+        role_att = cas.get("role_attendu")
+        int_att = cas.get("intention_attendue")
+
+        ok_cas = True
+        if role_att and role_predit != role_att:
+            ok_cas = False
+            echecs_replay.append(f"Rôle attendu `{role_att}` != `{role_predit}` sur « {prompt[:55]} »")
+        if int_att and int_att not in intentions_predites:
+            ok_cas = False
+            echecs_replay.append(f"Intention attendue `{int_att}` manquée sur « {prompt[:55]} »")
+
+        if ok_cas:
+            reussis += 1
+
+    taux = round((reussis / float(len(suite))) * 100.0, 2)
+    return taux, echecs_replay
 
 
 def _valider_phrase_generaliste(
@@ -286,7 +464,6 @@ def _valider_phrase_generaliste(
     dataset: dict[str, Any],
     embed_model: str,
 ) -> tuple[bool, str]:
-    """Vérifie qu'une nouvelle phrase d'entraînement est généraliste, propre et sans collision."""
     propre = phrase.strip()
     if len(propre.split()) < 4:
         return False, "rejetée : trop courte (< 4 mots)"
@@ -327,10 +504,6 @@ def _backtester_seuil_routage(
     nouvelle_valeur: float,
     embed_model: str,
 ) -> tuple[bool, str]:
-    """
-    Rejoue le seuil candidat sur un échantillon d'échanges réels (échecs + succès)
-    pour vérifier qu'il améliore la précision sans dégrader les cas réussis.
-    """
     if param_court not in ("confiance_directe", "marge_directe"):
         return True, "validation directe (paramètre hors matrice de marge)"
 
@@ -340,7 +513,6 @@ def _backtester_seuil_routage(
     if not routes_data:
         return True, "dataset vide"
 
-    # Pré-calcul des vecteurs de référence sur CPU
     vecs_roles = {
         role: ollama.embed(model=embed_model, input=phrases, options={"num_gpu": 0}, keep_alive=-1)["embeddings"]
         for role, phrases in routes_data.items()
@@ -427,7 +599,7 @@ def _consolider_memoire_long_terme(
     nb_episodes_maj = 0
     nb_faits_ajoutes = 0
 
-    _log("\n[Phase 4 — Consolidation Mémoire] Synthèse épisodique & faits durables...", journal)
+    _log("\n[Phase 3 — Consolidation Mémoire] Synthèse épisodique & faits durables...", journal)
 
     for jour, items in sorted(par_jour.items()):
         if time.monotonic() >= deadline:
@@ -484,8 +656,9 @@ Réponds UNIQUEMENT en JSON valide :
             val = str(fait.get("valeur", "")).strip()
             if len(cle) >= 2 and len(val) >= 2 and not _contient_secret_potentiel(f"{cle} {val}"):
                 msg_mem = memoriser_fait_utilisateur(cle, val)
-                nb_faits_ajoutes += 1
-                _log(f"  [+] Mémoire utile -> {msg_mem}", journal)
+                if not msg_mem.startswith("Refus"):
+                    nb_faits_ajoutes += 1
+                    _log(f"  [+] Mémoire utile -> {msg_mem}", journal)
 
         for idx, _ in items:
             echanges[idx]["consolide_memoire"] = True
@@ -506,12 +679,12 @@ Réponds UNIQUEMENT en JSON valide :
 
 def executer_optimisation_nocturne(duree_max_minutes: int = 55) -> str:
     """
-    Exécute une optimisation complète, lente et thermiquement maîtrisée (jusqu'à ~1h max) :
-    1. Snapshot de backup avant toute modification.
+    Exécute une optimisation complète, thermiquement maîtrisée et protégée contre les régressions :
+    1. Snapshot de backup + mesure baseline du replay de régression.
     2. Audit silencieux des échanges passés non vérifiés.
-    3. Diagnostic approfondi + ajustements fins par dichotomie (seuils, températures, phrases généralistes, règles).
-    4. Backtest hors-ligne des réglages candidats.
-    5. Consolidation mémoire & rédaction d'un rapport final détaillé.
+    3. Diagnostic approfondi + ajustements fins par dichotomie.
+    4. Consolidation mémoire long terme.
+    5. Replay de régression final : validation ou rollback automatique + rapport détaillé.
     """
     debut_ts = time.monotonic()
     deadline = debut_ts + max(5, int(duree_max_minutes)) * 60
@@ -535,7 +708,7 @@ def executer_optimisation_nocturne(duree_max_minutes: int = 55) -> str:
     hist_opti = _charger_historique_optimisations()
     chemin_backup = _creer_snapshot_backup(horodatage_id)
 
-    juge = config.get("modele_optimiseur", "qwen2.5-coder:14B")
+    juge = config.get("modele_optimiseur", "qwen2.5-coder:14b")
     embed_model = _obtenir_embed_model(config)
     t_gpu_init, t_cpu_init = _lire_temperatures()
 
@@ -546,10 +719,20 @@ def executer_optimisation_nocturne(duree_max_minutes: int = 55) -> str:
     )
     _log(f"[Backup] Snapshot initial sauvegardé : {chemin_backup}", journal)
 
+    # Mesure de référence avant toute modification (Replay de régression)
+    suite_regression = _charger_suite_regression(config)
+    score_replay_avant, echecs_replay_avant = _simuler_routage_complet(
+        suite_regression, config, dataset, embed_model
+    )
+    _log(
+        f"[Replay Baseline] Score suite de régression ({len(suite_regression)} cas) : {score_replay_avant:.2f} %",
+        journal,
+    )
+
     def _heartbeat_si_necessaire(etape_label: str) -> None:
         nonlocal dernier_heartbeat
         maintenant = time.monotonic()
-        if (maintenant - dernier_heartbeat) >= 120.0:  # Log périodique toutes les 2 minutes
+        if (maintenant - dernier_heartbeat) >= 120.0:
             ecoule_min = (maintenant - debut_ts) / 60.0
             tg, tc = _lire_temperatures()
             _log(
@@ -762,7 +945,7 @@ Réponds UNIQUEMENT en JSON valide :
                     except (TypeError, ValueError):
                         pass
 
-            # C. Ajustement dichotomique des hyperparamètres d'un modèle (temperature / num_predict)
+            # C. Ajustement dichotomique des hyperparamètres d'un modèle
             aj_m = verdict.get("ajustement_modele")
             if isinstance(aj_m, dict) and aj_m.get("modele") in config.get("routes", {}):
                 nom_m = str(aj_m["modele"])
@@ -789,7 +972,6 @@ Réponds UNIQUEMENT en JSON valide :
                     try:
                         np_souhaite = int(aj_m["num_predict_cible"])
                         np_act = int(cfg_m.get("num_predict", 512))
-                        # Pas borné à ±256 tokens par passe
                         delta_np = max(-256, min(256, np_souhaite - np_act))
                         np_nouveau = max(60, min(2048, np_act + delta_np))
                         if abs(np_nouveau - np_act) >= 32:
@@ -844,14 +1026,42 @@ Réponds UNIQUEMENT en JSON valide :
     nb_episodes, nb_faits = _consolider_memoire_long_terme(echanges, juge, journal, deadline)
 
     # =========================================================================
-    # PHASE 4 : PERSISTANCE ATOMIQUE, HISTORIQUE BACKUP & RAPPORT FINAL EXPLIQUÉ
+    # PHASE 4 : REPLAY DE RÉGRESSION FINAL, ROLLBACK SI DÉGRADATION & RAPPORT
     # =========================================================================
-    if config_modifiee:
-        _ecrire_atomique(CONFIG_FILE, json.dumps(config, indent=2, ensure_ascii=False))
-    if dataset_modifie:
-        _ecrire_atomique(TRAINING_FILE, json.dumps(dataset, indent=2, ensure_ascii=False))
+    statut_replay = f"Stable ({score_replay_avant:.2f} %)"
+    rollback_effectue = False
+
+    if config_modifiee or dataset_modifie:
+        score_replay_apres, echecs_replay_apres = _simuler_routage_complet(
+            suite_regression, config, dataset, embed_model
+        )
+        _log(
+            f"\n[Phase 4 — Replay de Régression] Score avant : {score_replay_avant:.2f} % -> "
+            f"Score après : {score_replay_apres:.2f} % ({len(suite_regression)} cas)",
+            journal,
+        )
+
+        if score_replay_apres < (score_replay_avant - 0.5):
+            rollback_effectue = _restaurer_snapshot_backup(horodatage_id)
+            config_modifiee = False
+            dataset_modifie = False
+            actions_cles.clear()
+            statut_replay = (
+                f"RÉGRESSION DÉTECTÉE ({score_replay_avant:.2f} % -> {score_replay_apres:.2f} %) "
+                f"-> Rollback automatique effectué"
+            )
+            _log(f"  [!] {statut_replay}", journal)
+            for err_rep in echecs_replay_apres[:6]:
+                _log(f"      - {err_rep}", journal)
+        else:
+            statut_replay = f"Validé ({score_replay_avant:.2f} % -> {score_replay_apres:.2f} %)"
+            if config_modifiee:
+                _ecrire_atomique(CONFIG_FILE, json.dumps(config, indent=2, ensure_ascii=False))
+            if dataset_modifie:
+                _ecrire_atomique(TRAINING_FILE, json.dumps(dataset, indent=2, ensure_ascii=False))
 
     sauvegarder_tous_echanges(echanges)
+    compacter_base_donnees()
 
     # Décharge proprement le modèle juge de la RTX 5050
     try:
@@ -863,32 +1073,38 @@ Réponds UNIQUEMENT en JSON valide :
     t_gpu_fin, t_cpu_fin = _lire_temperatures()
 
     resume_court = (
-        f"{len(echecs)} échec(s) analysé(s), {len(actions_cles)} ajustement(s) validé(s), "
-        f"mémoire +{nb_episodes} épisode(s) / +{nb_faits} fait(s) en {duree_totale_min:.1f} min."
+        f"{len(echecs)} échec(s) analysé(s), {len(actions_cles)} ajustement(s) retenu(s), "
+        f"replay={statut_replay}, mémoire +{nb_episodes} épisode(s) / +{nb_faits} fait(s) en {duree_totale_min:.1f} min."
     )
     hist_opti["sessions"].append(
         {
             "date": datetime.now().isoformat(timespec="seconds"),
             "backup": chemin_backup,
             "duree_min": round(duree_totale_min, 2),
+            "rollback": rollback_effectue,
             "resume_court": resume_court,
             "actions_cles": actions_cles,
         }
     )
     _sauvegarder_historique_optimisations(hist_opti)
 
-    # Génération du rapport final lisible et complet
     lignes_rapport = [
         f"# Rapport d'Optimisation Eon — {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}",
         "",
-        f"- **Durée totale :** {duree_totale_min:.1f} minute(s) | **Backup créé :** `{chemin_backup}`",
+        f"- **Durée totale :** {duree_totale_min:.1f} minute(s) | **Backup :** `{chemin_backup}`",
+        f"- **Replay de régression :** {statut_replay}",
         f"- **Températures :** Début (GPU {t_gpu_init or '?'}°C / CPU {t_cpu_init or '?'}°C) -> Fin (GPU {t_gpu_fin or '?'}°C / CPU {t_cpu_fin or '?'}°C)",
         f"- **Bilan global :** {resume_court}",
         "",
         "## 1. Modifications appliquées et justifications",
         "",
     ]
-    if explications_detaillees:
+    if rollback_effectue:
+        lignes_rapport.append(
+            "**Alerte Replay :** Les modifications proposées ont dégradé la précision sur la suite de régression "
+            "et ont été automatiquement annulées."
+        )
+    elif explications_detaillees:
         lignes_rapport.extend(explications_detaillees)
     else:
         lignes_rapport.append("Aucune modification de paramètre nécessaire lors de cette passe (stabilité confirmée).")
@@ -914,9 +1130,99 @@ Réponds UNIQUEMENT en JSON valide :
     _log(f"[RAPPORT COMPLET] Écrit dans : {RAPPORT_FINAL_FILE}", journal)
     _log("=" * 70, journal)
 
-    # Sauvegarde du journal complet en fin de session
     entete_log = f"\n{'=' * 70}\nSESSION D'OPTIMISATION — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n{'=' * 70}\n"
     existant = OPTIMISEUR_LOG_FILE.read_text(encoding="utf-8") if OPTIMISEUR_LOG_FILE.exists() else ""
     _ecrire_atomique(OPTIMISEUR_LOG_FILE, (existant + entete_log + "\n".join(journal) + "\n")[-120000:])
 
     return rapport_md
+
+
+# ---------------- BOUCLE D'AUTO-ÉVALUATION NOCTURNE / VEILLE ----------------
+
+class PlanificateurNocturneEon:
+    """
+    Surveille discrètement l'inactivité utilisateur et l'état matériel du portable
+    pour lancer l'auto-évaluation la nuit (01h00–05h30) ou après une longue pause.
+    """
+
+    def __init__(
+        self,
+        heure_debut: int = 1,
+        heure_fin: int = 5,
+        inactivite_min_sec: float = 900.0,
+        seuil_echanges_en_attente: int = 6,
+    ) -> None:
+        self.heure_debut = heure_debut
+        self.heure_fin = heure_fin
+        self.inactivite_min_sec = inactivite_min_sec
+        self.seuil_echanges_en_attente = seuil_echanges_en_attente
+        self._dernier_activite_ts: float = time.monotonic()
+        self._derniere_execution_date: str = ""
+        self._arret = threading.Event()
+        self._en_cours = threading.Lock()
+
+    def notifier_activite_utilisateur(self) -> None:
+        self._dernier_activite_ts = time.monotonic()
+
+    def _conditions_materielles_ok(self) -> tuple[bool, str]:
+        sur_secteur, bat_pct = _etat_alimentation_portable()
+        if not sur_secteur and bat_pct < 55:
+            return False, f"sur batterie faible ({bat_pct}%)"
+        t_gpu, t_cpu = _lire_temperatures()
+        if (t_gpu is not None and t_gpu > 68.0) or (t_cpu is not None and t_cpu > 74.0):
+            return False, f"température trop haute (GPU={t_gpu}°C, CPU={t_cpu}°C)"
+        return True, "ok"
+
+    def _doit_se_declencher(self) -> bool:
+        maintenant_dt = datetime.now()
+        aujourd_hui = maintenant_dt.date().isoformat()
+        if self._derniere_execution_date == aujourd_hui:
+            return False
+
+        inactivite = time.monotonic() - self._dernier_activite_ts
+        if inactivite < self.inactivite_min_sec:
+            return False
+
+        dans_fenetre_nuit = self.heure_debut <= maintenant_dt.hour <= self.heure_fin
+        if not dans_fenetre_nuit:
+            return False
+
+        echanges = charger_tous_echanges()
+        non_verifies = sum(
+            1 for e in echanges
+            if not e.get("audite_ok") and not e.get("traite_optimiseur") and e.get("raison") != "règle:phatique"
+        )
+        return non_verifies >= self.seuil_echanges_en_attente
+
+    def boucle_surveillance(self) -> None:
+        while not self._arret.is_set():
+            try:
+                if self._doit_se_declencher():
+                    ok_mat, _ = self._conditions_materielles_ok()
+                    if ok_mat and self._en_cours.acquire(blocking=False):
+                        try:
+                            self._derniere_execution_date = datetime.now().date().isoformat()
+                            executer_optimisation_nocturne(duree_max_minutes=45)
+                        finally:
+                            self._en_cours.release()
+            except Exception:
+                pass
+            self._arret.wait(timeout=180.0)
+
+    def demarrer(self) -> threading.Thread:
+        t = threading.Thread(target=self.boucle_surveillance, name="EonNightlyOptimizer", daemon=True)
+        t.start()
+        return t
+
+    def arreter(self) -> None:
+        self._arret.set()
+
+
+if __name__ == "__main__":
+    # Permet de lancer l'optimiseur manuellement ou via un timer systemd --user
+    if "--daemon" in sys.argv:
+        planif = PlanificateurNocturneEon()
+        planif.boucle_surveillance()
+    else:
+        duree = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 55
+        executer_optimisation_nocturne(duree_max_minutes=duree)

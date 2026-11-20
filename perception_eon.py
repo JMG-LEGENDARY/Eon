@@ -1,8 +1,13 @@
+import base64
+from collections import deque
+import hashlib
+import hmac
 import json
 import math
 import os
 import queue
 import re
+import secrets
 import select
 import signal
 import sys
@@ -63,7 +68,6 @@ COCO_CLASSES_FR = {
     73: "livre",
 }
 
-# Détection du mot-clé "Éon" (y compris variantes phonétiques fréquentes de Whisper en français)
 REGEX_WAKE_WORD = re.compile(
     r"(?:\b(?:[ée]ons?|eons?|h[ée]ons?|eyon|ayon)\b|^(?:eh\s+on|et\s+on|est\s+on)\b)",
     re.IGNORECASE,
@@ -93,6 +97,7 @@ class MessageEntrant:
     texte: str
     source: str  # "clavier" | "voix"
     confiance_locuteur: float = 1.0
+    confiance_asr: float = 0.0
 
 
 def _cosinus(a: np.ndarray, b: np.ndarray) -> float:
@@ -145,16 +150,75 @@ def _reechantillonner_16k(audio: np.ndarray, sr_source: int) -> np.ndarray:
     return np.interp(x_nouveau, x_ancien, signal_f).astype(np.float32)
 
 
+def _deriver_cle_machine() -> bytes:
+    """Dérive une clé matérielle locale liée à la machine Fedora et à l'utilisateur courant."""
+    machine_id = b"eon-local-fallback"
+    for chemin_id in (Path("/etc/machine-id"), Path("/var/lib/dbus/machine-id")):
+        if chemin_id.exists():
+            try:
+                machine_id = chemin_id.read_bytes().strip()
+                break
+            except OSError:
+                pass
+    identite_os = f"{os.getuid()}:{os.path.expanduser('~')}".encode("utf-8")
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        machine_id + b":" + identite_os,
+        b"Eon-Biometric-Vault-v1",
+        100_000,
+        dklen=64,
+    )
+
+
+def _chiffrer_vault_biometrique(payload: dict) -> dict:
+    """Chiffre et authentifie les vecteurs biométriques au repos (SHAKE-256 CTR + HMAC-SHA256)."""
+    cle_maitre = _deriver_cle_machine()
+    cle_enc, cle_mac = cle_maitre[:32], cle_maitre[32:]
+    nonce = secrets.token_bytes(16)
+    clair = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    flux = hashlib.shake_256(cle_enc + nonce).digest(len(clair))
+    chiffre = bytes(a ^ b for a, b in zip(clair, flux))
+    tag = hmac.new(cle_mac, nonce + chiffre, hashlib.sha256).digest()
+
+    return {
+        "version": 2,
+        "algorithme": "SHAKE256-CTR-HMAC-SHA256",
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "ciphertext": base64.b64encode(chiffre).decode("ascii"),
+        "tag": base64.b64encode(tag).decode("ascii"),
+    }
+
+
+def _dechiffrer_vault_biometrique(enveloppe: dict) -> dict:
+    """Déchiffre et vérifie l'intégrité du coffre biométrique."""
+    cle_maitre = _deriver_cle_machine()
+    cle_enc, cle_mac = cle_maitre[:32], cle_maitre[32:]
+    nonce = base64.b64decode(enveloppe["nonce"])
+    chiffre = base64.b64decode(enveloppe["ciphertext"])
+    tag_recu = base64.b64decode(enveloppe["tag"])
+
+    tag_attendu = hmac.new(cle_mac, nonce + chiffre, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag_recu, tag_attendu):
+        raise ValueError("Signature HMAC invalide : profil biométrique corrompu ou falsifié.")
+
+    flux = hashlib.shake_256(cle_enc + nonce).digest(len(chiffre))
+    clair = bytes(a ^ b for a, b in zip(chiffre, flux))
+    return json.loads(clair.decode("utf-8"))
+
+
 class PerceptionEon:
-    """Perception locale basse consommation (100 % licences permissives MIT / Apache-2.0 / BSD)."""
+    """Perception locale basse consommation (100 % MIT/Apache-2.0/BSD) avec anti-spoofing et coffre biométrique."""
 
     def __init__(
         self,
         config_eon: dict | None = None,
         on_alerte_securite: Callable[[str], None] | None = None,
+        on_regard_detecte: Callable[[], None] | None = None,
     ) -> None:
         self.cfg = config_eon or {}
         self.on_alerte_securite = on_alerte_securite
+        self.on_regard_detecte = on_regard_detecte
         self.file_messages: queue.Queue[MessageEntrant] = queue.Queue()
         self.interruption_event = threading.Event()
         self.ia_en_cours = threading.Event()
@@ -162,11 +226,13 @@ class PerceptionEon:
         self.pret_pour_saisie.set()
         self.arret_global = threading.Event()
 
-        # Mode sécurité : "auto" (analyse si inconnu seul), "absent" (alerte immédiate), "off"
+        self._tts = None
+
         self.mode_securite: str = str(self.cfg.get("mode_securite", "auto"))
         self._dernier_check_intrus_ts: float = 0.0
         self._debut_inconnu_seul_ts: float = 0.0
         self._dernier_verdict_securite: str = "RAS"
+        self._dernier_prechauffage_ts: float = 0.0
 
         self._lock_vision = threading.Lock()
         self._derniere_frame: np.ndarray | None = None
@@ -181,18 +247,17 @@ class PerceptionEon:
         self._objets_detectes_actuels: list[str] = []
         self._position_visage_actuel: str = ""
         self._luminosite_actuelle: float = 0.0
+        self._historique_geometrie_3d: deque[tuple[float, float]] = deque(maxlen=12)
 
         self.camera_active: bool = False
         self.statut_camera: str = "initialisation"
         self.micro_actif: bool = False
         self.statut_micro: str = "initialisation"
 
-        # Biométrie multi-résidents (stockage exclusivement local)
         self.profils_visages: dict[str, np.ndarray] = {}
         self.profil_voix: np.ndarray | None = None
         self._charger_profil()
 
-        # Détecteurs vision légers CPU (Apache-2.0 / MIT uniquement)
         self._yolox_net = None
         self._hog_personnes = None
         self._yunet = None
@@ -205,6 +270,10 @@ class PerceptionEon:
         self._transcriptions_en_attente = 0
         self._logs_audio_live: queue.Queue[str] = queue.Queue(maxsize=200)
         self._installer_signal_interruption()
+
+    def attacher_tts(self, tts) -> None:
+        """Connecte le client TTS pour l'anti-écho micro et l'interruption vocale."""
+        self._tts = tts
 
     # ---------------- CONTRÔLES UI & INTERRUPTION ----------------
 
@@ -219,7 +288,6 @@ class PerceptionEon:
         self.pret_pour_saisie.set()
 
     def soumettre_texte_clavier(self, texte: str) -> None:
-        """Appelé directement par Textual lors de la validation de l'Input."""
         propre = texte.strip()
         if not propre:
             return
@@ -227,9 +295,11 @@ class PerceptionEon:
         self.file_messages.put(MessageEntrant(texte=propre, source="clavier"))
 
     def declencher_interruption(self) -> None:
-        """Appelé par la touche Échap (Textual ou TTY) ou le barge-in vocal validé."""
+        """Coupe immédiatement la génération LLM et la lecture vocale."""
         if self.ia_en_cours.is_set():
             self.interruption_event.set()
+        if self._tts is not None:
+            self._tts.arreter()
 
     def _installer_signal_interruption(self) -> None:
         def _handler(signum, frame):
@@ -258,13 +328,21 @@ class PerceptionEon:
             except queue.Empty:
                 break
 
-    # ---------------- BIOMÉTRIE MULTI-PROFILS ----------------
+    # ---------------- BIOMÉTRIE CHIFFRÉE & SÉCURITÉ CLAVIER ----------------
 
     def _charger_profil(self) -> None:
         if not PROFIL_EON_FILE.exists():
             return
         try:
-            data = json.loads(PROFIL_EON_FILE.read_text(encoding="utf-8"))
+            brut = json.loads(PROFIL_EON_FILE.read_text(encoding="utf-8"))
+            a_migrer = False
+            if brut.get("version") == 2 and "ciphertext" in brut:
+                data = _dechiffrer_vault_biometrique(brut)
+            else:
+                # Migration transparente d'un ancien fichier en clair vers le coffre chiffré
+                data = brut
+                a_migrer = True
+
             if isinstance(data.get("visages"), dict):
                 for nom, vec in data["visages"].items():
                     if vec:
@@ -274,29 +352,47 @@ class PerceptionEon:
 
             if data.get("voix"):
                 self.profil_voix = np.array(data["voix"], dtype=np.float32)
-        except (json.JSONDecodeError, OSError, ValueError):
-            pass
+
+            if a_migrer and (self.profils_visages or self.profil_voix is not None):
+                self._sauvegarder_profil()
+        except Exception as err:
+            panels.log_perception(f"[SÉCURITÉ BIOMÉTRIE] Lecture profil ignorée : {err}")
 
     def _sauvegarder_profil(self) -> None:
-        data = {
+        payload = {
             "visages": {nom: vec.tolist() for nom, vec in self.profils_visages.items()},
             "voix": self.profil_voix.tolist() if self.profil_voix is not None else None,
         }
+        enveloppe = _chiffrer_vault_biometrique(payload)
         tmp = PROFIL_EON_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.write_text(json.dumps(enveloppe, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.chmod(tmp, 0o600)
         os.replace(tmp, PROFIL_EON_FILE)
 
+    def verifier_identite_clavier(self) -> tuple[bool, str]:
+        """Vérifie si une personne non reconnue tape sur le terminal."""
+        if not self.camera_active or not self._profils_visages_compatibles():
+            return True, "non_verifie"
+        with self._lock_vision:
+            identites = list(self._personnes_identifiees)
+        if not identites:
+            return True, "aucun_visage"
+        inconnus = [n for n in identites if n.startswith("Inconnu")]
+        residents = [n for n in identites if not n.startswith("Inconnu") and n != "Non calibré"]
+        if inconnus and not residents:
+            return False, ", ".join(inconnus)
+        return True, ", ".join(residents)
+
     def enregistrer_visage_autorise(self, nom: str = "Bryan") -> str:
-        """Enregistre le visage actuellement visible devant la caméra comme personne autorisée."""
         nom_propre = nom.strip().capitalize() or "Bryan"
         with self._lock_vision:
             vec = self._dernier_vecteur_visage.copy() if self._dernier_vecteur_visage is not None else None
         if vec is None:
-            return "Aucun visage détecté face à la caméra : regarde l'objectif puis relance `/enroll`."
+            return "Aucun visage vivant détecté face à la caméra : regarde l'objectif puis relance `/enroll`."
         self.profils_visages[nom_propre] = vec
         self._sauvegarder_profil()
-        panels.log_perception(f"[BIOMÉTRIE] Visage enregistré pour : {nom_propre}")
-        return f"Profil facial enregistré pour « {nom_propre} » ({len(self.profils_visages)} profil(s) autorisé(s))."
+        panels.log_perception(f"[BIOMÉTRIE] Visage chiffré et enregistré pour : {nom_propre}")
+        return f"Profil facial chiffré enregistré pour « {nom_propre} » ({len(self.profils_visages)} profil(s) autorisé(s))."
 
     def reinitialiser_profil_biometrique(self, nom: str | None = None) -> str:
         if nom:
@@ -318,7 +414,6 @@ class PerceptionEon:
             return
         MODELS_VISION_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Modèles YOLOX sous licence Apache-2.0 (aucun modèle AGPL)
         for nom_yolox in ("object_detection_yolox_2022nov.onnx", "yolox_nano.onnx", "yolox_s.onnx"):
             chemin_yolox = MODELS_VISION_DIR / nom_yolox
             if chemin_yolox.exists():
@@ -336,7 +431,6 @@ class PerceptionEon:
             hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
             self._hog_personnes = hog
 
-        # YuNet (MIT) + SFace (Apache-2.0) issus d'OpenCV Model Zoo
         yunet_path = MODELS_VISION_DIR / "face_detection_yunet_2023mar.onnx"
         sface_path = MODELS_VISION_DIR / "face_recognition_sface_2021dec.onnx"
         if yunet_path.exists() and hasattr(cv2, "FaceDetectorYN"):
@@ -352,7 +446,6 @@ class PerceptionEon:
                 self._sface = None
 
     def _detecter_objets_rapide(self, frame: np.ndarray) -> tuple[int, list[str]]:
-        """Détection d'objets Apache-2.0 (YOLOX ONNX ou OpenCV HOG) en ~15-25 ms sur CPU."""
         h_img, w_img = frame.shape[:2]
 
         if self._yolox_net is not None:
@@ -414,12 +507,52 @@ class PerceptionEon:
         norme = float(np.linalg.norm(vec))
         return vec / norme if norme > 0 else vec
 
+    def _verifier_vivacite_liveness(self, gris: np.ndarray, face_row: np.ndarray) -> tuple[bool, str]:
+        """Anti-spoofing passif : rejette les écrans de smartphone et photos imprimées."""
+        h_img, w_img = gris.shape[:2]
+        x, y, w, h = int(face_row[0]), int(face_row[1]), int(face_row[2]), int(face_row[3])
+        x1, y1 = max(0, x), max(0, y)
+        x2, y2 = min(w_img, x + w), min(h_img, y + h)
+        if (x2 - x1) < 40 or (y2 - y1) < 40:
+            return False, "visage trop petit"
+
+        roi = gris[y1:y2, x1:x2]
+        roi_norm = cv2.resize(roi, (96, 96))
+
+        # 1. Texture haute fréquence (un écran filmé ou photo floue perd en netteté micro-cutanée)
+        nettete_laplacien = float(cv2.Laplacian(roi_norm, cv2.CV_64F).var())
+        if nettete_laplacien < 28.0:
+            return False, f"texture lissée/écran (lap={nettete_laplacien:.1f})"
+
+        # 2. Saturation spéculaire anormale (reflet vitre/écran OLED)
+        ratio_sature = float(np.mean(roi_norm >= 252))
+        if ratio_sature > 0.14:
+            return False, f"reflet écran détecté ({ratio_sature:.0%})"
+
+        # 3. Parallaxe 3D non-rigide des repères YuNet (nez vs axe des yeux)
+        re_x, re_y = float(face_row[4]), float(face_row[5])
+        le_x, le_y = float(face_row[6]), float(face_row[7])
+        nt_x, nt_y = float(face_row[8]), float(face_row[9])
+        dist_yeux = max(1.0, math.hypot(le_x - re_x, le_y - re_y))
+        mid_x, mid_y = (re_x + le_x) * 0.5, (re_y + le_y) * 0.5
+        proj_x = (nt_x - mid_x) / dist_yeux
+        proj_y = (nt_y - mid_y) / dist_yeux
+
+        self._historique_geometrie_3d.append((proj_x, proj_y))
+        if len(self._historique_geometrie_3d) >= 10:
+            arr = np.array(self._historique_geometrie_3d, dtype=np.float32)
+            micro_mouvement = float(np.std(arr[:, 0]) + np.std(arr[:, 1]))
+            # Une photo parfaitement immobile sur un support a une variance quasi nulle
+            if micro_mouvement < 0.0006:
+                return False, "image statique figée"
+
+        return True, "vivant"
+
     def _identifier_visage(
         self,
         vec: np.ndarray,
         identites_deja_attribuees: set[str] | None = None,
     ) -> tuple[str, float]:
-        """Compare un vecteur facial aux résidents enregistrés sans autoriser de clones sur la même frame."""
         profils_valides = self._profils_visages_compatibles()
         if not profils_valides:
             return "Non calibré", 0.0
@@ -441,7 +574,7 @@ class PerceptionEon:
                 meilleur_nom = nom
 
         if meilleur_score >= seuil:
-            if meilleur_score >= 0.62:
+            if meilleur_score >= 0.64:
                 nouveau_ref = 0.94 * self.profils_visages[meilleur_nom] + 0.06 * vec
                 norme = float(np.linalg.norm(nouveau_ref))
                 if norme > 0:
@@ -451,15 +584,11 @@ class PerceptionEon:
 
     @staticmethod
     def _score_regard_frontal(face_row: np.ndarray) -> float:
-        """
-        Calcule un score [0.0..1.0] d'attention visuelle vers la caméra/écran dans un repère
-        invariant à l'inclinaison de la tête (roll) grâce aux 5 points clés YuNet (yeux, nez, bouche).
-        """
-        re_x, re_y = float(face_row[4]), float(face_row[5])   # Œil droit sujet
-        le_x, le_y = float(face_row[6]), float(face_row[7])   # Œil gauche sujet
-        nt_x, nt_y = float(face_row[8]), float(face_row[9])   # Pointe du nez
-        rc_x, rc_y = float(face_row[10]), float(face_row[11]) # Coin droit bouche
-        lc_x, lc_y = float(face_row[12]), float(face_row[13]) # Coin gauche bouche
+        re_x, re_y = float(face_row[4]), float(face_row[5])
+        le_x, le_y = float(face_row[6]), float(face_row[7])
+        nt_x, nt_y = float(face_row[8]), float(face_row[9])
+        rc_x, rc_y = float(face_row[10]), float(face_row[11])
+        lc_x, lc_y = float(face_row[12]), float(face_row[13])
 
         dx_yeux = le_x - re_x
         dy_yeux = le_y - re_y
@@ -467,12 +596,10 @@ class PerceptionEon:
         if dist_yeux < 18.0:
             return 0.0
 
-        # 1. Inclinaison latérale de la tête (roll)
         roll_deg = abs(math.degrees(math.atan2(dy_yeux, dx_yeux)))
         if roll_deg > 28.0:
             return 0.0
 
-        # Repère orthonormé lié au visage : u = axe inter-oculaire, v = axe vertical descendant
         ux, uy = dx_yeux / dist_yeux, dy_yeux / dist_yeux
         vx, vy = -uy, ux
 
@@ -481,7 +608,6 @@ class PerceptionEon:
         mid_mouth_x = (rc_x + lc_x) * 0.5
         mid_mouth_y = (rc_y + lc_y) * 0.5
 
-        # Projections nez et bouche
         dn_x, dn_y = nt_x - mid_eyes_x, nt_y - mid_eyes_y
         dm_x, dm_y = mid_mouth_x - mid_eyes_x, mid_mouth_y - mid_eyes_y
 
@@ -493,10 +619,6 @@ class PerceptionEon:
         pitch_mouth = max(1.0, dm_x * vx + dm_y * vy)
         ratio_vertical = (dn_x * vx + dn_y * vy) / pitch_mouth
 
-        # Plages normales face à la caméra :
-        # - yaw_err <= 0.16 (tête bien de face, pas tournée à gauche/droite)
-        # - pitch_nose dans [0.35, 0.76] (pas tête baissée sur clavier/téléphone ni levée)
-        # - ratio_vertical dans [0.42, 0.68] (proportion yeux-nez / yeux-bouche cohérente)
         if yaw_err > 0.22 or not (0.30 <= pitch_nose <= 0.82) or not (0.38 <= ratio_vertical <= 0.74):
             return 0.0
 
@@ -505,7 +627,7 @@ class PerceptionEon:
         score_vert = max(0.0, 1.0 - abs(ratio_vertical - 0.56) / 0.18)
         return round(0.50 * score_yaw + 0.30 * score_pitch + 0.20 * score_vert, 2)
 
-    # ---------------- ESCALADE SÉMANTIQUE VERS GEMMA 3 12B ----------------
+    # ---------------- ESCALADE SÉMANTIQUE VERS VLM ----------------
 
     def _analyser_intrusion_vlm(self, frame: np.ndarray, motif_declenchement: str) -> None:
         dossier_alertes = BASE_DIR / "captures" / "alertes"
@@ -525,7 +647,8 @@ class PerceptionEon:
             "RÈGLE IMPORTANTE : Être assis devant un ordinateur, porter un casque audio/micro, "
             "avoir les cheveux longs ou porter des vêtements sombres dans une pièce éclairée est TOTALEMENT NORMAL. "
             "Classe en 'suspect' ou 'intrusion' UNIQUEMENT en cas d'acte manifestement anormal "
-            "(fouille de tiroirs/affaires, cagoule/masque couvrant le visage, lampe torche dans le noir, dégradation). "
+            "(fouille de tiroirs/affaires, cagoule/masque couvrant le visage, lampe torche dans le noir, dégradation, "
+            "ou présentation d'un téléphone/photo devant la webcam pour usurper une identité). "
             "Réponds UNIQUEMENT en JSON valide sur une ligne : "
             '{"niveau": "normal|suspect|intrusion", "description": "phrase factuelle courte"}'
         )
@@ -549,10 +672,13 @@ class PerceptionEon:
             self._dernier_verdict_securite = f"{niveau.upper()} : {desc}"
             panels.log_perception(f"[VERDICT SÉCURITÉ] {self._dernier_verdict_securite}")
 
-            if niveau in ("suspect", "intrusion") and self.on_alerte_securite is not None:
-                self.on_alerte_securite(
-                    f"[ALERTE CAMÉRA - {niveau.upper()}] {desc} (capture : {chemin_img})"
-                )
+            if niveau in ("suspect", "intrusion"):
+                if self._tts is not None:
+                    self._tts.alerter(f"Alerte sécurité : {desc}")
+                if self.on_alerte_securite is not None:
+                    self.on_alerte_securite(
+                        f"[ALERTE CAMÉRA - {niveau.upper()}] {desc} (capture : {chemin_img})"
+                    )
         except Exception as err:
             panels.log_perception(f"[SÉCURITÉ] Erreur analyse VLM : {err}")
 
@@ -667,6 +793,7 @@ class PerceptionEon:
         dernier_resume_log = ""
         dernier_log_ts = 0.0
         derniere_presence_ts = time.monotonic()
+        etait_regard_precedent = False
         frame_idx = 0
 
         try:
@@ -710,6 +837,11 @@ class PerceptionEon:
                                 continue
                             boites_retenues.append(boite)
 
+                            est_vivant, motif_liveness = self._verifier_vivacite_liveness(gris, f)
+                            if not est_vivant:
+                                identites.append(f"Inconnu (spoof:{motif_liveness})")
+                                continue
+
                             if self._sface is not None:
                                 aligne = self._sface.alignCrop(frame, f)
                                 vec = self._sface.feature(aligne).flatten()
@@ -720,7 +852,6 @@ class PerceptionEon:
                             nom_id = "Inconnu"
                             if vec is not None:
                                 nom_id, _ = self._identifier_visage(vec, identites_prises)
-                                # Grâce d'identité de 2.0s pour éviter les faux "Inconnu" quand l'utilisateur tourne légèrement la tête
                                 if nom_id == "Inconnu" and self._dernier_resident_reconnu and (maintenant - self._dernier_resident_ts) <= 2.0:
                                     nom_id = self._dernier_resident_reconnu
                                 elif nom_id not in ("Inconnu", "Non calibré"):
@@ -740,6 +871,8 @@ class PerceptionEon:
                                 position_desc = f"{horiz}, {dist}"
                                 if nom_id != "Inconnu":
                                     score_regard_frame = self._score_regard_frontal(f)
+                    else:
+                        self._historique_geometrie_3d.clear()
                 else:
                     ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
                     masque = cv2.inRange(
@@ -762,12 +895,23 @@ class PerceptionEon:
                         score_regard_frame = 0.8 if nom_id != "Inconnu" else 0.0
                         position_desc = "centre"
 
-                # Lissage temporel + hystérésis sur l'attention visuelle
                 self._regard_ema = 0.60 * self._regard_ema + 0.40 * score_regard_frame
                 if self._visage_detecte_actuel:
                     regard_resident = self._regard_ema >= 0.32
                 else:
                     regard_resident = self._regard_ema >= 0.48
+
+                # Déclencheur prédictif : l'utilisateur vient de tourner la tête vers l'écran
+                if (
+                    regard_resident
+                    and not etait_regard_precedent
+                    and self.on_regard_detecte is not None
+                    and not self.ia_en_cours.is_set()
+                    and (maintenant - self._dernier_prechauffage_ts) >= 12.0
+                ):
+                    self._dernier_prechauffage_ts = maintenant
+                    threading.Thread(target=self.on_regard_detecte, daemon=True).start()
+                etait_regard_precedent = regard_resident
 
                 nb_total_personnes = max(nb_pers_corps, len(identites))
                 if nb_total_personnes > len(identites):
@@ -808,7 +952,7 @@ class PerceptionEon:
                             target=self._analyser_intrusion_vlm,
                             args=(
                                 frame.copy(),
-                                f"{len(inconnus_presents)} inconnu(s) seul(s) depuis {duree_inconnu:.1f}s",
+                                f"{len(inconnus_presents)} inconnu(s) seul(s) depuis {duree_inconnu:.1f}s ({', '.join(inconnus_presents)})",
                             ),
                             daemon=True,
                         ).start()
@@ -943,7 +1087,6 @@ class PerceptionEon:
     def _journaliser_ecoute_continue(self, texte: str, statut: str) -> None:
         if not texte:
             return
-        # Par défaut (RGPD / usage commercial), on ne sauvegarde pas les écoutes passives sur disque
         if statut == "passif" and not bool(self.cfg.get("journaliser_audio_passif", False)):
             return
         try:
@@ -957,7 +1100,6 @@ class PerceptionEon:
             pass
 
     def _lister_et_choisir_micro(self) -> tuple[int | str | None, str, int]:
-        """Liste toutes les entrées audio dans les logs et choisit le meilleur périphérique."""
         device_cfg = self.cfg.get("micro_device", None)
         try:
             devices = sd.query_devices()
@@ -1009,7 +1151,6 @@ class PerceptionEon:
             threading.Thread(target=self._charger_whisper, daemon=True).start()
 
             seuil_rms_min = float(self.cfg.get("seuil_micro_rms", 0.016))
-            # Pauses naturelles : 1.4s si on regarde l'écran (laisse finir les phrases), 0.9s sinon
             pause_regard_blocs = int(float(self.cfg.get("pause_fin_phrase_regard_sec", 1.4)) * 10)
             pause_passive_blocs = int(float(self.cfg.get("pause_fin_phrase_passive_sec", 0.9)) * 10)
 
@@ -1056,7 +1197,6 @@ class PerceptionEon:
                 if rms > pic_rms_seconde:
                     pic_rms_seconde = rms
 
-                # Calibration automatique du bruit ambiant sur les 15 premiers blocs (1.5s)
                 if blocs_calibration < 15:
                     blocs_calibration += 1
                     echantillons_calib.append(rms)
@@ -1072,29 +1212,32 @@ class PerceptionEon:
                     return
 
                 regarde = self.regarde_ecran_maintenant(tolerance_sec=0.45)
-                seuil_dynamique = max(seuil_rms_min, bruit_ambiant_rms * 1.65)
+                ia_parle_audio = self._tts is not None and self._tts.est_en_train_de_parler()
+
+                facteur_echo = 2.6 if ia_parle_audio else 1.0
+                seuil_dynamique = max(seuil_rms_min, bruit_ambiant_rms * 1.65) * facteur_echo
                 seuil_courant = seuil_dynamique
 
-                # Barge-in sécurisé
-                if self.ia_en_cours.is_set():
-                    seuil_interruption = max(seuil_rms_min * 1.6, bruit_ambiant_rms * 2.2)
+                if self.ia_en_cours.is_set() or ia_parle_audio:
+                    seuil_interruption = max(seuil_rms_min * 2.2, bruit_ambiant_rms * 3.0)
                     if regarde and rms > seuil_interruption:
                         blocs_barge_in += 1
-                        if blocs_barge_in == 8 and len(tampon_parole) >= 7:
-                            extrait_test = np.concatenate(tampon_parole[-8:])
+                        if blocs_barge_in == 7 and len(tampon_parole) >= 6:
+                            extrait_test = np.concatenate(tampon_parole[-7:])
                             if self.profil_voix is None:
-                                self.interruption_event.set()
+                                self.declencher_interruption()
                             else:
                                 sim_v = _cosinus(self.profil_voix, self._extraire_signature_voix(extrait_test, 16000))
                                 if sim_v >= 0.65:
-                                    self.interruption_event.set()
+                                    self.declencher_interruption()
                     else:
                         blocs_barge_in = 0
                 else:
                     blocs_barge_in = 0
 
                 if not en_parole:
-                    bruit_ambiant_rms = 0.94 * bruit_ambiant_rms + 0.06 * rms
+                    if not ia_parle_audio:
+                        bruit_ambiant_rms = 0.94 * bruit_ambiant_rms + 0.06 * rms
                     pre_buffer.append(morceau)
                     if len(pre_buffer) > 8:
                         pre_buffer.pop(0)
@@ -1114,7 +1257,6 @@ class PerceptionEon:
                     if regarde:
                         blocs_regard_parole += 1
 
-                    # Seuil de maintien plus bas (0.55x) pour ne pas couper sur les fins de mots
                     if rms > seuil_dynamique * 0.55:
                         blocs_silence = 0
                     else:
@@ -1124,9 +1266,12 @@ class PerceptionEon:
 
                     if blocs_silence >= cible_silence or len(tampon_parole) >= 180:
                         sature_duree = len(tampon_parole) >= 180
-                        # On retire l'excédent de silence de fin tout en gardant 2 blocs (0.2s) de marge
                         a_retirer = max(0, blocs_silence - 2)
-                        tranches = tampon_parole[:-a_retirer] if a_retirer > 0 and a_retirer < len(tampon_parole) else tampon_parole
+                        tranches = (
+                            tampon_parole[:-a_retirer]
+                            if a_retirer > 0 and a_retirer < len(tampon_parole)
+                            else tampon_parole
+                        )
                         audio_complet = np.concatenate(tranches)
 
                         ratio_regard = blocs_regard_parole / float(max(1, blocs_totaux_parole))
@@ -1141,7 +1286,7 @@ class PerceptionEon:
                         tampon_parole = []
                         pre_buffer = []
 
-                        if sature_duree:
+                        if sature_duree and not ia_parle_audio:
                             bruit_ambiant_rms = max(bruit_ambiant_rms, rms_moy * 1.1)
                             self._push_log_audio(
                                 f"[CALIBRATION] Bruit ambiant ajusté à {bruit_ambiant_rms:.4f}"
@@ -1186,7 +1331,12 @@ class PerceptionEon:
                     if blocs_calibration < 15:
                         panels.maj_vu_micro("Calibration bruit ambiant en cours...")
                     else:
-                        etat = "PAROLE" if en_parole else "écoute"
+                        if self._tts is not None and self._tts.est_en_train_de_parler():
+                            etat = "TTS/ÉCHO"
+                        elif en_parole:
+                            etat = "PAROLE"
+                        else:
+                            etat = "écoute"
                         vu = _barre_vu(dernier_rms, echelle=max(0.05, seuil_courant * 3.5))
                         panels.maj_vu_micro(
                             f"{vu} RMS:{dernier_rms:.4f} (pic:{pic_rms_seconde:.4f} / seuil:{seuil_courant:.4f}) [{etat}]"
@@ -1233,11 +1383,13 @@ class PerceptionEon:
                     morceaux_bruts = []
                     morceaux_valides = []
                     prob_silence_min = 1.0
+                    prob_log_min = 0.0
                     for seg in segments:
                         txt_seg = seg.text.strip()
                         nsp = float(getattr(seg, "no_speech_prob", 0.0))
                         alp = float(getattr(seg, "avg_logprob", 0.0))
                         prob_silence_min = min(prob_silence_min, nsp)
+                        prob_log_min = min(prob_log_min, alp)
                         if txt_seg:
                             morceaux_bruts.append(txt_seg)
                         if nsp <= 0.60 and alp >= -0.85:
@@ -1257,7 +1409,7 @@ class PerceptionEon:
             self._push_log_audio("[WHISPER] (silence / bruit non verbal)")
             return
 
-        self._push_log_audio(f"[WHISPER] « {texte_brut} » (ns={prob_silence_min:.2f})")
+        self._push_log_audio(f"[WHISPER] « {texte_brut} » (ns={prob_silence_min:.2f}, lp={prob_log_min:.2f})")
 
         texte_norm = texte.lower().strip(" !?.,;:")
         if (
@@ -1276,8 +1428,8 @@ class PerceptionEon:
             self._journaliser_ecoute_continue(texte, "passif")
             return
 
-        if self.ia_en_cours.is_set() and contient_eon:
-            self.interruption_event.set()
+        if (self.ia_en_cours.is_set() or (self._tts is not None and self._tts.est_en_train_de_parler())) and contient_eon:
+            self.declencher_interruption()
 
         autorise, conf = self._verifier_locuteur(audio)
         if not autorise and not contient_eon:
@@ -1297,13 +1449,20 @@ class PerceptionEon:
                 self.profils_visages["Bryan"] = vec_v
                 self.profil_voix = self._extraire_signature_voix(audio)
                 self._sauvegarder_profil()
-                self._push_log_audio("[BIOMÉTRIE] Profil calibré (Bryan).")
+                self._push_log_audio("[BIOMÉTRIE] Profil chiffré calibré (Bryan).")
 
         motif_declenchement = "mot-clé Éon" if contient_eon and not a_regarde else ("regard+Éon" if contient_eon else "regard")
         self.pret_pour_saisie.clear()
         self._push_log_audio(f"[VOIX -> EON | {motif_declenchement}] {texte}")
         self._journaliser_ecoute_continue(texte, f"actif:{motif_declenchement}")
-        self.file_messages.put(MessageEntrant(texte=texte, source="voix", confiance_locuteur=conf))
+        self.file_messages.put(
+            MessageEntrant(
+                texte=texte,
+                source="voix",
+                confiance_locuteur=conf,
+                confiance_asr=prob_log_min,
+            )
+        )
 
     # ---------------- CLAVIER FALLBACK (SI TEXTUAL INACTIF) ----------------
 
@@ -1319,7 +1478,7 @@ class PerceptionEon:
                             pret, _, _ = select.select([sys.stdin], [], [], 0.08)
                             if pret:
                                 if sys.stdin.read(1) == "\x1b":
-                                    self.interruption_event.set()
+                                    self.declencher_interruption()
                                     break
                     except Exception:
                         time.sleep(0.1)

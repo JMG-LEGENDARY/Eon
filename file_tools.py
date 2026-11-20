@@ -13,12 +13,29 @@ DOSSIERS_IGNORES = {
 }
 RACINE_AUTORISEE = Path.home().resolve()
 
-# La confirmation interactive est gérée en amont par main.py (ou via CALLBACK_CONFIRMATION)
+# Coffres et clés privées interdits en lecture ET écriture pour prévenir toute exfiltration
+DOSSIERS_INTERDITS = {
+    (RACINE_AUTORISEE / ".ssh").resolve(),
+    (RACINE_AUTORISEE / ".gnupg").resolve(),
+    (RACINE_AUTORISEE / ".aws").resolve(),
+    (RACINE_AUTORISEE / ".local" / "share" / "kwalletd").resolve(),
+    (RACINE_AUTORISEE / ".config" / "kdewallet").resolve(),
+}
+
+# Fichiers critiques d'Eon protégés contre la modification directe par un LLM (anti-escalade)
+FICHIERS_LECTURE_SEULE = {
+    (BASE_DIR / "config_ia.json").resolve(),
+    (BASE_DIR / "config_ia.bak.json").resolve(),
+}
+FICHIERS_INTERDITS = {
+    (BASE_DIR / "profil_eon.json").resolve(),
+}
+
 MODE_FICHIERS = "auto"  # "ask" | "auto" | "ro"
 CALLBACK_CONFIRMATION: Callable[[str, str], bool] | None = None
 
 
-def _resoudre_chemin(chemin: str) -> Path:
+def _resoudre_chemin(chemin: str, pour_ecriture: bool = False) -> Path:
     nettoye = re.sub(r"/\s+", "/", chemin.strip().strip("\"'"))
     p = Path(nettoye).expanduser()
     if not p.is_absolute():
@@ -30,11 +47,20 @@ def _resoudre_chemin(chemin: str) -> Path:
 
     if RACINE_AUTORISEE not in p.parents and p != RACINE_AUTORISEE:
         raise PermissionError(f"Accès refusé hors de {RACINE_AUTORISEE} : {p}")
+
+    if p in FICHIERS_INTERDITS or any(d == p or d in p.parents for d in DOSSIERS_INTERDITS):
+        raise PermissionError(f"Accès bloqué par politique de sécurité (coffre sensible) : {p.name}")
+
+    if pour_ecriture and p in FICHIERS_LECTURE_SEULE:
+        raise PermissionError(
+            f"Modification directe bloquée sur {p.name} (utilisez les commandes `/web`, `/file`, `/shell` ou `/reload`)."
+        )
+
     return p
 
 
 def _ecrire_atomique(cible: Path, contenu: str) -> None:
-    tmp = cible.with_suffix(cible.suffix + ".tmp")
+    tmp = Path(f"{cible}.tmp")
     tmp.write_text(contenu, encoding="utf-8")
     os.replace(tmp, cible)
 
@@ -60,7 +86,7 @@ def lister_fichiers(dossier: str = ".", max_profondeur: int = 3) -> str:
         L'arborescence textuelle des fichiers trouvés.
     """
     try:
-        racine = _resoudre_chemin(dossier)
+        racine = _resoudre_chemin(dossier, pour_ecriture=False)
         if not racine.exists() or not racine.is_dir():
             return f"Dossier introuvable : {dossier}"
 
@@ -77,6 +103,8 @@ def lister_fichiers(dossier: str = ".", max_profondeur: int = 3) -> str:
                 return
             for entree in entrees:
                 if entree.name in DOSSIERS_IGNORES:
+                    continue
+                if entree.resolve() in DOSSIERS_INTERDITS or entree.resolve() in FICHIERS_INTERDITS:
                     continue
                 indent = "  " * niveau
                 if entree.is_dir():
@@ -104,7 +132,7 @@ def lire_fichier(chemin: str, ligne_debut: int = 1, ligne_fin: int = 250) -> str
         Le contenu numéroté du fichier.
     """
     try:
-        cible = _resoudre_chemin(chemin)
+        cible = _resoudre_chemin(chemin, pour_ecriture=False)
         if not cible.exists() or not cible.is_file():
             return f"Fichier introuvable : {chemin}"
 
@@ -132,7 +160,7 @@ def chercher_dans_fichiers(motif: str, dossier: str = ".") -> str:
         Les occurrences trouvées avec fichier et numéro de ligne.
     """
     try:
-        racine = _resoudre_chemin(dossier)
+        racine = _resoudre_chemin(dossier, pour_ecriture=False)
         if not racine.is_dir():
             return f"Dossier introuvable : {dossier}"
 
@@ -142,6 +170,9 @@ def chercher_dans_fichiers(motif: str, dossier: str = ".") -> str:
 
         for chemin in racine.rglob("*"):
             if any(part in DOSSIERS_IGNORES for part in chemin.parts) or not chemin.is_file():
+                continue
+            resolu = chemin.resolve()
+            if resolu in FICHIERS_INTERDITS or any(d in resolu.parents for d in DOSSIERS_INTERDITS):
                 continue
             if chemin.stat().st_size > 512_000:
                 continue
@@ -172,7 +203,7 @@ def modifier_fichier(chemin: str, ancien_texte: str, nouveau_texte: str) -> str:
         Confirmation de la modification ou message d'erreur.
     """
     try:
-        cible = _resoudre_chemin(chemin)
+        cible = _resoudre_chemin(chemin, pour_ecriture=True)
         if not cible.is_file():
             return f"Fichier introuvable : {chemin}"
 
@@ -197,7 +228,7 @@ def modifier_fichier(chemin: str, ancien_texte: str, nouveau_texte: str) -> str:
         if not ok:
             return msg_refus
 
-        cible.with_suffix(cible.suffix + ".bak").write_text(contenu_actuel, encoding="utf-8")
+        Path(f"{cible}.bak").write_text(contenu_actuel, encoding="utf-8")
         _ecrire_atomique(cible, nouveau_contenu)
         panels.log_outil(f"[FS] Modifié : {cible}")
         return f"Fichier modifié avec succès : {cible} (sauvegarde .bak créée)."
@@ -216,7 +247,7 @@ def ecrire_fichier(chemin: str, contenu: str) -> str:
         Confirmation d'écriture ou refus.
     """
     try:
-        cible = _resoudre_chemin(chemin)
+        cible = _resoudre_chemin(chemin, pour_ecriture=True)
         existe = cible.exists()
         apercu = f"{'Écrasement' if existe else 'Création'} de {cible} ({len(contenu)} caractères)\n---\n{contenu[:600]}"
 
@@ -226,7 +257,7 @@ def ecrire_fichier(chemin: str, contenu: str) -> str:
 
         cible.parent.mkdir(parents=True, exist_ok=True)
         if existe:
-            cible.with_suffix(cible.suffix + ".bak").write_text(cible.read_text(encoding="utf-8"), encoding="utf-8")
+            Path(f"{cible}.bak").write_text(cible.read_text(encoding="utf-8"), encoding="utf-8")
         _ecrire_atomique(cible, contenu)
         panels.log_outil(f"[FS] Écrit : {cible}")
         return f"Fichier écrit avec succès : {cible}"
