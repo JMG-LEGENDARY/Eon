@@ -63,7 +63,7 @@ bash setup_voice_lab.sh
 deactivate
 ```
 
-*(Optionnel)* Place un échantillon audio propre de 5 à 15 secondes nommé `ma_voix_ref.wav` dans `IA_voice_lab/` pour activer le clonage vocal.
+*(Optionnel)* Place un échantillon audio propre de 8 à 15 secondes nommé `ma_voix_ref.wav` dans `IA_voice_lab/` pour activer le clonage vocal.
 
 ### 4. Téléchargement des modèles Ollama
 
@@ -157,25 +157,25 @@ Pour démarrer ou diagnostiquer manuellement le démon vocal dans un terminal s�
 
 ## Commandes interactives
 
-| Commande | Action |
-|---|---|
-| `@<alias> <message>` | Force un modèle sur un seul message (ex. `@code vérifie ce script`, `@c`, `@12b`). |
-| `/model <alias\|auto>` | Verrouille un modèle pour la session ou réactive le routage automatique. |
-| `/models` | Liste les modèles configurés, alias, rôles et permissions d'outils. |
-| `/tts [status\|test\|stop]` | Vérifie l'état du démon Chatterbox, lance un test vocal ou coupe la parole en cours. |
-| `/web <auto\|ask\|off>` | Règle la permission d'accès aux outils de recherche Web. |
-| `/file <auto\|ask\|off>` | Règle la permission d'écriture/modification de fichiers locaux. |
-| `/shell <auto\|ask\|off>` | Règle la permission d'exécution de commandes terminal. |
-| `/history [N]` | Affiche les `N` derniers échanges et les appels d'outils de la session. |
-| `/export [chemin]` | Exporte l'historique réel vers un fichier texte (défaut : `~/Téléchargements/conversation_eon.txt`). |
-| `/enroll [nom\|reset\|del <nom>]` | Enregistre un visage autorisé ou réinitialise la base biométrique. |
-| `/secu [auto\|absent\|off]` | Règle le mode de surveillance caméra. |
-| `/capteurs` | Affiche l'état temps réel de la caméra, du regard et du microphone. |
-| `/forget` ou `/reset` | Purge le contexte actif en RAM. |
-| `/reload` | Recharge à chaud `config_ia.json` et `entrainement_routage.json`. |
-| `/optimize [min]` | Lance l'optimisation du routage en arrière-plan sous contrôle thermique (défaut : 55 min). |
-| `/help` | Affiche l'aide complète des commandes. |
-| `/quit` ou `/exit` | Arrête proprement le démon vocal, les capteurs et Eon. |
+| Commande                          | Action                                                                                                     |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| `@<alias> <message>`            | Force un modèle sur un seul message (ex. `@code vérifie ce script`, `@c`, `@12b`).                 |
+| `/model <alias\|auto>`           | Verrouille un modèle pour la session ou réactive le routage automatique.                                 |
+| `/models`                       | Liste les modèles configurés, alias, rôles et permissions d'outils.                                     |
+| `/tts [status\|test\|stop]`       | Vérifie l'état du démon Chatterbox, lance un test vocal ou coupe la parole en cours.                    |
+| `/web <auto\|ask\|off>`           | Règle la permission d'accès aux outils de recherche Web.                                                 |
+| `/file <auto\|ask\|off>`          | Règle la permission d'écriture/modification de fichiers locaux.                                          |
+| `/shell <auto\|ask\|off>`         | Règle la permission d'exécution de commandes terminal.                                                   |
+| `/history [N]`                  | Affiche les `N` derniers échanges et les appels d'outils de la session.                                 |
+| `/export [chemin]`              | Exporte l'historique réel vers un fichier texte (défaut : `~/Téléchargements/conversation_eon.txt`). |
+| `/enroll [nom\|reset\|del <nom>]` | Enregistre un visage autorisé ou réinitialise la base biométrique.                                      |
+| `/secu [auto\|absent\|off]`       | Règle le mode de surveillance caméra.                                                                    |
+| `/capteurs`                     | Affiche l'état temps réel de la caméra, du regard et du microphone.                                     |
+| `/forget` ou `/reset`         | Purge le contexte actif en RAM.                                                                            |
+| `/reload`                       | Recharge à chaud `config_ia.json` et `entrainement_routage.json`.                                     |
+| `/optimize [min]`               | Lance l'optimisation du routage en arrière-plan sous contrôle thermique (défaut : 55 min).              |
+| `/help`                         | Affiche l'aide complète des commandes.                                                                    |
+| `/quit` ou `/exit`            | Arrête proprement le démon vocal, les capteurs et Eon.                                                   |
 
 Les alias des modèles sont définis dans `config_ia.json` (`1b`, `c`, `g`, `code`, `code+`, `12b`).
 
@@ -195,17 +195,17 @@ La configuration active est `config_ia.json`. Les environnements virtuels (`.ven
 
 ## Structure du projet
 
-| Chemin | Rôle |
-|---|---|
-| `main.py` | Orchestrateur principal, boucle autonome d'outils, gestion VRAM et commandes slash. |
-| `router.py` | Routage sémantique (regex + embeddings `bge-m3` + superviseur IA) et analyse d'intentions. |
-| `config_ia.json` | Configuration des routes, seuils, alias, règles regex, paramètres TTS et permissions. |
-| `context_compressor.py` | Gestionnaire de contexte à 3 niveaux (VRAM / RAM / Disque). |
-| `memory_manager.py` | Base SQLite chiffrée, faits durables et recherche dans l'historique. |
-| `perception_eon.py` | Pipeline temps réel webcam (YuNet, SFace, YOLO11n) et audio (Faster-Whisper, anti-écho). |
-| `tts_client.py` | Client IPC Unix vers Chatterbox avec nettoyage Markdown et auto-démarrage du démon. |
-| `IA_voice_lab/` | Environnement Python 3.12 dédié au démon vocal Chatterbox (`tts_daemon.py`) et échantillon de référence. |
-| `terminal_panels.py` | Interface TUI multi-panneaux (chat, logs routeur, vision, audio). |
-| `file_tools.py`, `shell_tools.py`, `web_tools.py` | Modules d'outils système, fichiers et recherche Internet. |
-| `optimizer.py` | Optimisation autonome des seuils et consolidation mémoire. |
-| `models_vision/` | Modèles ONNX pour la détection et reconnaissance faciale / objets. |
+| Chemin                                                  | Rôle                                                                                                            |
+| ------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `main.py`                                             | Orchestrateur principal, boucle autonome d'outils, gestion VRAM et commandes slash.                              |
+| `router.py`                                           | Routage sémantique (regex + embeddings `bge-m3` + superviseur IA) et analyse d'intentions.                    |
+| `config_ia.json`                                      | Configuration des routes, seuils, alias, règles regex, paramètres TTS et permissions.                          |
+| `context_compressor.py`                               | Gestionnaire de contexte à 3 niveaux (VRAM / RAM / Disque).                                                     |
+| `memory_manager.py`                                   | Base SQLite chiffrée, faits durables et recherche dans l'historique.                                            |
+| `perception_eon.py`                                   | Pipeline temps réel webcam (YuNet, SFace, YOLO11n) et audio (Faster-Whisper, anti-écho).                       |
+| `tts_client.py`                                       | Client IPC Unix vers Chatterbox avec nettoyage Markdown et auto-démarrage du démon.                            |
+| `IA_voice_lab/`                                       | Environnement Python 3.12 dédié au démon vocal Chatterbox (`tts_daemon.py`) et échantillon de référence. |
+| `terminal_panels.py`                                  | Interface TUI multi-panneaux (chat, logs routeur, vision, audio).                                                |
+| `file_tools.py`, `shell_tools.py`, `web_tools.py` | Modules d'outils système, fichiers et recherche Internet.                                                       |
+| `optimizer.py`                                        | Optimisation autonome des seuils et consolidation mémoire.                                                      |
+| `models_vision/`                                      | Modèles ONNX pour la détection et reconnaissance faciale / objets.                                             |
