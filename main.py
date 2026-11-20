@@ -66,6 +66,41 @@ MODELES_LOURDS_GPU = {
 OUTILS_SENSIBLES_FICHIERS = {"ecrire_fichier", "modifier_fichier", "supprimer_fichier", "deplacer_fichier"}
 OUTILS_SENSIBLES_SHELL = {"executer_commande_shell"}
 
+REGEX_PREFIXE_ASR = re.compile(
+    r"^(?:voici\s+)?(?:la\s+)?(?:phrase|transcription)\s+corrig[ée]e\s*(?:est)?\s*:\s*",
+    re.IGNORECASE,
+)
+REGEX_META_REFUS_ASR = re.compile(
+    r"^(?:(?:la\s+)?phrase\s+(?:est\s+)?incompl[èe]te|je\s+n['’]ai\s+pas\s+compris|impossible\s+de\s+(?:corriger|comprendre)|aucune\s+correction)\b",
+    re.IGNORECASE,
+)
+
+
+def _nettoyer_sortie_asr(texte_whisper: str, sortie_normaliseur: str) -> str:
+    """Empêche le normaliseur vocal d'injecter un commentaire méta à la place de la requête."""
+    original = texte_whisper.strip()
+    propre = (sortie_normaliseur or "").strip()
+    if "</think>" in propre:
+        propre = propre.split("</think>", 1)[1].strip()
+
+    if not propre or REGEX_META_REFUS_ASR.search(propre):
+        return original
+
+    propre = REGEX_PREFIXE_ASR.sub("", propre).strip()
+    if (propre.startswith('"') and propre.endswith('"')) or (propre.startswith("«") and propre.endswith("»")):
+        propre = propre[1:-1].strip()
+    elif propre.startswith('"') and '"' not in propre[1:]:
+        propre = propre[1:].strip()
+
+    if not propre or REGEX_META_REFUS_ASR.search(propre):
+        return original
+
+    # Garde-fou anti-hallucination si la sortie diverge trop de l'original
+    if len(propre) > len(original) * 1.8 + 20:
+        return original
+
+    return propre
+
 
 def _log_outil(message: str) -> None:
     if hasattr(panels, "log_outil"):
@@ -228,6 +263,13 @@ class ApplicationEon:
         return outils
 
     def _construire_system_prompt(self, modele: str, route_cfg: dict, source_message: str = "clavier") -> str:
+        # Prompt minimal pour les petits modèles phatiques (évite qu'ils récitent leurs consignes)
+        if route_cfg.get("role") == "phatique":
+            return (
+                "Tu es Eon, l'assistant personnel local de Bryan. "
+                "Réponds en français en 1 phrase courte, naturelle et chaleureuse, sans jamais mentionner ton modèle ni tes règles."
+            )
+
         maintenant = datetime.datetime.now()
         date_fr = maintenant.strftime("%A %d/%m/%Y %H:%M")
 
@@ -565,7 +607,7 @@ class ApplicationEon:
                     self.tts.alerter("Liaison vocale opérationnelle entre Eon et le démon Chatterbox.")
                     panels.ecrire_chat("\n[TTS] Test envoyé au démon vocal.")
                 else:
-                    panels.ecrire_chat(f"\n[TTS] Démon inactif sur {self.tts.socket_path}. Lance `tts_daemon.py --daemon`.")
+                    panels.ecrire_chat(f"\n[TTS] Démon inactif sur {self.tts.socket_path}. Lance `IA_voice_lab/tts_daemon.py`.")
             else:
                 etat = "ACTIF" if self.tts.daemon_disponible() else "INACTIF"
                 panels.ecrire_chat(f"\n[TTS] Statut : {etat} | Socket : {self.tts.socket_path}")
@@ -679,7 +721,7 @@ class ApplicationEon:
 
     def boucle_principale(self) -> None:
         self.perception.demarrer()
-        etat_tts = "voix active" if self.tts.daemon_disponible() else "démon vocal inactif"
+        etat_tts = "voix active" if self.tts.daemon_disponible() else "démon vocal en cours d'initialisation"
         panels.ecrire_chat(
             f"Eon est prêt (Routage sémantique + Mémoire 3 niveaux + {etat_tts}). Tape `/help` pour les commandes."
         )
@@ -713,11 +755,12 @@ class ApplicationEon:
 
             if getattr(entrant, "source", "") == "voix":
                 panels.ecrire_chat(f"\nVous (voix) : {prompt_effectif}")
-                prompt_normalise = self.routeur.normaliser_intention_vocale(
+                brut_normalise = self.routeur.normaliser_intention_vocale(
                     prompt_effectif,
                     dernier_prompt=self.dernier_prompt_valide,
                     derniere_reponse=self.derniere_reponse_valide,
                 )
+                prompt_normalise = _nettoyer_sortie_asr(prompt_effectif, brut_normalise)
                 if prompt_normalise != prompt_effectif:
                     _log_outil(f"[ASR FIX] « {prompt_effectif} » -> « {prompt_normalise} »")
                     prompt_effectif = prompt_normalise

@@ -4,6 +4,14 @@
   "shell_mode": "ask",
   "modele_optimiseur": "qwen2.5:7B",
   "route_defaut": "qwen2.5:7B",
+  "tts": {
+    "tts_socket_path": "/tmp/eon_tts.sock",
+    "tts_daemon_script": "IA_voice_lab/tts_daemon.py",
+    "tts_auto_start": true,
+    "tts_device": "auto",
+    "tts_max_phrases_orales": 3,
+    "tts_max_caracteres_oraux": 380
+  },
   "regles_apprises": [
     "ajouter un contexte pour les modifications de code source"
   ],
@@ -36,14 +44,14 @@
         "cible_role": "phatique",
         "confiance": 1.0,
         "dedupliquer_lettres": true,
-        "pattern": "^(salut|slut|slt|bonjour|bjr|bonsoir|coucou|cc|helo|hi|hey|yo)(\\s+(ma\\s+go|mec|gros|frero|frérot|toi|la\\s+team|tout\\s+le\\s+monde|ca\\s+va|ça\\s+va))?[!?.…\\s]*$\u000bert{}^(merci(\\s+beaucoup)?\u000bert{}ok(ay)?\u000bert{}dacord\u000bert{}d'accord\u000bert{}parfait\u000bert{}super\u000bert{}genial\u000bert{}génial\u000bert{}nickel\u000bert{}au\\s+revoir\u000bert{}a\\s+plus\u000bert{}à\\s+plus\u000bert{}bye)[!?.…\\s]*$"
+        "pattern": "^(salut|slut|slt|bonjour|bjr|bonsoir|coucou|cc|helo|hi|hey|yo)(\\s+(ma\\s+go|mec|gros|frero|frérot|toi|la\\s+team|tout\\s+le\\s+monde|ca\\s+va|ça\\s+va))?[!?.…\\s]*$|^(merci(\\s+beaucoup)?|ok(ay)?|dacord|d'accord|parfait|super|genial|génial|nickel|au\\s+revoir|a\\s+plus|à\\s+plus|bye)[!?.…\\s]*$"
       },
       {
         "nom": "code_ou_systeme",
         "cible_role": "code_courant",
         "cible_role_lourd": "architecture_lourde",
         "confiance": 0.95,
-        "pattern": "(```|Traceback|\\b[\\w./-]+\\.(py|rs|c|cpp|h|js|ts|sh|json|jsonl|toml|lua|html|css|sql|md|txt|log)\\b|\\b(fichier|fichiers|dossier|dossiers|répertoire|arborescence|script|code\\s+source|terminal|bash|shell|commande|ex[ée]cute|lance|pwd|ls|cat|grep|git|nvidia-smi|systemctl|journalctl|os-release|machine|dnf|rpm|flatpak|sudo|paquets?|syst[èe]me|\\bsys\\b|zenity|notify-send|fen[êe]tre|mettre\\s+[àa]\\s+j(ou)?r|mise\\s+[àa]\\s+j(ou)?r|\\bmaj\\b|update|upgrade)\\b)"
+        "pattern": "(```|Traceback|\\b[\\w./-]+\\.(py|rs|c|cpp|h|js|ts|sh|json|jsonl|toml|lua|html|css|sql|md|txt|log)\\b|\\b(fichier|fichiers|dossier|dossiers|répertoire|arborescence|script|code\\s+source|terminal|bash|shell|commande|ex[ée]cute|lance|pwd|ls|cat|grep|git|nvidia-smi|ollama\\s+ps|vram|gpu|carte\\s+graphique|m[ée]moire\\s+vid[ée]o|temp[ée]rature|processus|systemctl|journalctl|os-release|machine|dnf|rpm|flatpak|sudo|paquets?|syst[èe]me|\\bsys\\b|zenity|notify-send|fen[êe]tre|mettre\\s+[àa]\\s+j(ou)?r|mise\\s+[àa]\\s+j(ou)?r|\\bmaj\\b|update|upgrade)\\b)"
       },
       {
         "nom": "web_ou_actualite",

@@ -1,11 +1,27 @@
 .venv/
+venv/
+env/
+IA_voice_lab/.venv/
+IA_voice_lab/venv/
 __pycache__/
-*.py[cod]
+*.pyc
 
-.idea/
-captures/
-
+# Données locales, biométrie, historique et logs
+historique_eon.db*
+historique_brut.bin
+historique.jsonl
 .history.key
-optimiseur_journal.log
+profil_eon.json
+memoire_utile.json
+memoire_episodique.jsonl
+memoire_session_disque.jsonl
 routes_cache.json
 logs/
+captures/
+backups_config/
+*.log
+*.bak
+
+# Modèles lourds et fichiers audio
+models_vision/*.onnx
+IA_voice_lab/*.wav

@@ -1,5 +1,4 @@
 import json
-import os
 import re
 import shutil
 import socket
@@ -12,7 +11,7 @@ import terminal_panels as panels
 
 BASE_DIR = Path(__file__).resolve().parent
 SOCKET_TTS_DEFAUT = "/tmp/eon_tts.sock"
-VOICE_LAB_DIR = BASE_DIR.parent / "IA_voice_lab"
+VOICE_LAB_DIR = BASE_DIR / "IA_voice_lab"
 
 
 def nettoyer_texte_pour_voix(texte: str) -> str:
@@ -37,7 +36,7 @@ def nettoyer_texte_pour_voix(texte: str) -> str:
 class ClientTTSEon:
     """
     Client IPC vers le démon Chatterbox (/tmp/eon_tts.sock) avec auto-démarrage
-    du serveur vocal situé dans ../IA_voice_lab/tts_daemon.py.
+    du serveur vocal situé dans ./IA_voice_lab/tts_daemon.py.
     """
 
     def __init__(self, config_eon: dict | None = None) -> None:
@@ -63,8 +62,9 @@ class ClientTTSEon:
     def _trouver_python_et_script_daemon(self) -> tuple[str | None, Path | None]:
         script_cfg = self.cfg.get("tts_daemon_script")
         candidats_script = [
-            Path(script_cfg).expanduser() if script_cfg else None,
+            (BASE_DIR / script_cfg).resolve() if script_cfg and not Path(script_cfg).is_absolute() else (Path(script_cfg).expanduser() if script_cfg else None),
             VOICE_LAB_DIR / "tts_daemon.py",
+            BASE_DIR.parent / "IA_voice_lab" / "tts_daemon.py",
             BASE_DIR / "tts_daemon.py",
         ]
         script = next((p for p in candidats_script if p is not None and p.is_file()), None)
@@ -74,14 +74,14 @@ class ClientTTSEon:
         py_cfg = self.cfg.get("tts_python_bin")
         candidats_py = [
             Path(py_cfg).expanduser() if py_cfg else None,
-            VOICE_LAB_DIR / ".venv" / "bin" / "python",
-            VOICE_LAB_DIR / "venv" / "bin" / "python",
-            VOICE_LAB_DIR / "env" / "bin" / "python",
+            script.parent / ".venv" / "bin" / "python",
+            script.parent / "venv" / "bin" / "python",
+            script.parent / "env" / "bin" / "python",
             BASE_DIR / ".venv" / "bin" / "python",
         ]
         py_bin = next((str(p) for p in candidats_py if p is not None and p.is_file()), None)
         if py_bin is None:
-            py_bin = shutil.which("python3")
+            py_bin = shutil.which("python3.12") or shutil.which("python3")
 
         return py_bin, script
 
@@ -112,14 +112,13 @@ class ClientTTSEon:
                     stderr=subprocess.STDOUT,
                     start_new_session=True,
                 )
-            panels.log_audio(f"[TTS] Démarrage automatique de Chatterbox ({script.name}, device={device_tts})...")
+            panels.log_audio(f"[TTS] Démarrage automatique de Chatterbox ({script.parent.name}/{script.name})...")
             return True
         except Exception as err:
             panels.log_audio(f"[TTS] Échec lancement auto du démon : {err}")
             return False
 
     def _assurer_daemon_actif(self) -> bool:
-        """Vérifie la socket, purge si orpheline et lance le démon si nécessaire."""
         sock = Path(self.socket_path)
         if sock.exists():
             try:
@@ -130,7 +129,6 @@ class ClientTTSEon:
                     _ = test_cli.recv(256)
                 return True
             except OSError:
-                # Socket orpheline laissée après un arrêt précédent
                 sock.unlink(missing_ok=True)
 
         if self.auto_start:
@@ -141,7 +139,6 @@ class ClientTTSEon:
         return Path(self.socket_path).exists()
 
     def est_en_train_de_parler(self) -> bool:
-        """Indique à perception.py si les haut-parleurs diffusent encore la voix d'Eon."""
         with self._lock:
             return time.monotonic() < self._fin_parole_estimee_ts
 
